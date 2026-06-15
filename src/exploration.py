@@ -1,5 +1,4 @@
 import json
-import time
 import gzip
 import io
 import os
@@ -8,7 +7,6 @@ import shutil
 import math
 import re
 import multiprocessing
-import concurrent
 import zstandard as zstd
 import random
 
@@ -16,7 +14,6 @@ from argparse import ArgumentParser
 from pathlib import Path
 from glob import glob
 from multiprocessing import Process,Pool,TimeoutError
-from concurrent.futures import ThreadPoolExecutor
 
 
 UNIT_CHOICES = {
@@ -24,9 +21,6 @@ UNIT_CHOICES = {
     "GB": math.pow(1024, 3),
     "TB": math.pow(1024, 4),
 }
-
-
-dict_lock = multiprocessing.Lock()
 
 
 def view_json_data(json_path: str):
@@ -67,6 +61,7 @@ def process_json_file(path: str):
         collection = collection[0].split("/")[1]
 
     bytes = 0
+    data = b""
     extension = Path(path).suffix
     if extension == ".gz":
         try:
@@ -76,7 +71,9 @@ def process_json_file(path: str):
                 bytes = 0
                 with gzip.open(buf, 'rb') as f:
                     while chunk := f.read(65536):
+                        # data += chunk
                         bytes += len(chunk)
+            # data = data.decode("utf-8")
             print(f"Processed {path}")
             # bytes = int(result.stdout.decode("utf-8"))
         except Exception as exc:
@@ -93,10 +90,12 @@ def process_json_file(path: str):
                 dctx = zstd.ZstdDecompressor()
                 with dctx.stream_reader(buf) as reader:
                     while chunk := reader.read(65536):
+                        # data += chunk
                         bytes += len(chunk)
                 # print(f"Uncompressed size: {size} bytes")
                 # bytes = int(zstd_out.stderr.decode("utf-8").split(" ")[1])        
-           print(f"Processed {path}")
+            # data = data.decode("utf-8")
+            print(f"Processed {path}")
         except Exception as exc:
             print(f"Error occurred while processing {path}")
             print(exc)
@@ -105,16 +104,13 @@ def process_json_file(path: str):
     else: # probably don't process the file if it's not compressed 
         print(f"Skipped {path}")
         bytes=0
-        # skipped_files += 1
-        # skipped_file_names.append(json)
 
-    # just need to lock to write to the dictionary
-    # lock.acquire()
-    # if collection not in collection_sizes:
-    #         collection_sizes[collection] = 0
-    # collection_sizes[collection] += bytes
-    # lock.release()
-    return (path, collection, bytes)
+    documents = 0
+    # if data:
+    #     with json.loads(data) as data_dict:
+    #         documents = len(data_dict)
+        
+    return (path, collection, bytes, documents)
     # print(f"\033[K{json}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
 
     # then here we do the unzipping and processing of the actual data in the file
@@ -140,11 +136,11 @@ def process_json_file(path: str):
     # os.remove(f"./{path.name.replace('.gz', '')}")
 
 
-def get_corpus_metadata(root: Path, units: int, subset: str, nprocs: int):
+def get_corpus_metadata(root: Path, units: str, subset: str, nprocs: int):
     """
     Path is the root directory of the training data
     """
-    paths = get_json_paths(root)
+    paths = get_json_paths(root, subset)
     random.shuffle(paths) # shuffle the array to attempt to get an even distribution of work for threads
     # paths = paths
     # paths = [path for path in paths if subset != None and subset in path]
@@ -157,24 +153,28 @@ def get_corpus_metadata(root: Path, units: int, subset: str, nprocs: int):
     with Pool(processes=nprocs) as pool:
         results = pool.imap(process_json_file, paths, chunksize=1)
         for result in results:
-            file,collection,size = result
+            file,collection,size,num_docs = result
 
             # if the size is 0 we skipped the file
             if size == 0:
                 skipped_file_names.add(file)
 
             if collection not in collection_sizes:
-                collection_sizes[collection] = 0
-            collection_sizes[collection] += size
+                collection_sizes[collection] = {"size": 0, "documents": 0, "processed": 0, "total": 0}
+            collection_sizes[collection]["size"] += size
+            collection_sizes[collection]["documents"] += num_docs
+            collection_sizes[collection]["processed"] += 1 if size != 0 else 0
+            collection_sizes[collection]["total"] += 1
             dataset_size += size
 
             print(f"\033[K{file}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
 
     print("\nCollection totals:")
-    for collection in sorted(collection_sizes.items(), key=lambda x: x[1], reverse=True):
+    for collection in sorted(collection_sizes.items(), key=lambda x: x[1]["size"], reverse=True):
+        col = collection[0]
         print(
-            f"\t{collection[0]} -> {(collection_sizes[collection[0]] / UNIT_CHOICES[units]):.02f} {units} | " \
-            f"{(collection_sizes[collection[0]] / dataset_size) * 100:.02f}%"
+            f"\t{col} -> {(collection_sizes[col]['size'] / UNIT_CHOICES[units]):.02f} {units} | " \
+            f"{(collection_sizes[col]['size'] / dataset_size) * 100:.02f}% | {collection_sizes[col]['processed']} of {collection_sizes[col]['total']} processed"
         )
 
     # for json in paths:
@@ -229,9 +229,12 @@ def get_json_paths(root: Path, subset: str):
     print(f"{len(gz_paths)} gz files")
     print(f"{len(zstd_paths)} zstd files")
 
-    paths = [path for path in gz_paths + zstd_paths if subset and subset in path] 
-    print(paths)
+    if subset != None:
+        paths = [path for path in gz_paths + zstd_paths if subset and subset in path] 
+    else:
+        paths = gz_paths + zstd_paths
 
+    # print(paths)
     return paths
     # return gz_paths
 
