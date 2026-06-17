@@ -114,7 +114,9 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
         base_url="https://apps.inside.anl.gov/argoapi/api/v1/chat/openai/v1",
         api_key=os.environ["OPEN_AI_KEY"]
     )
-
+    
+    # give concrete classifications for now
+    prompt = f"""You are a document classifier. Cluster documents by topic similarity, and add a content difficulty classification for each document into one of: {categories}. Respond ONLY with a JSON array: [{{"id": "<id>", "category": "<category>", "confidence": "<high|medium|low>", "difficulty": "<content_difficulty>"}}]"""
     all_results = []
         
     for i in range(0, len(jsons), batch_size):
@@ -125,8 +127,6 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
         for doc in batch:
             # documents don't have titles, though all the jsons have a Text attribute
             doc_texts.append(f"[Content: {doc.get('Text', '')[:300]}")
-        
-        prompt = f"""You are a document classifier. Classify each document by topic."""
 
         response = client.chat.completions.create(
             model=model,
@@ -134,7 +134,7 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
             messages=[
                 {
                     "role": "system",
-                    "content": f"""You are a document classifier. Classify each document into one of: {categories}. Respond with ONLY a JSON array: [{{"id": "<id>", "category": "<category>", "confidence": "<high|medium|low>"}}]"""
+                    "content": prompt
                 },
                 {
                     "role": "user",
@@ -143,23 +143,19 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
             ]
         )
         
-        batch_results = json.loads(response.choices[0].message.content)
-        all_results.extend(batch_results)
+        if response.choices[0].message.content:
+            batch_results = json.loads(response.choices[0].message.content)
+            all_results.extend(batch_results)
         
         print(f"Processed batch {i // batch_size + 1} "
-            f"({len(all_results)}/{len(documents)} docs)")
+            f"({len(all_results)}/{len(jsons)} docs)")
         
         time.sleep(delay)  # Rate limiting
         
-        return all_results
+    return all_results
 
 
-    results = batch_classify(documents, categories, batch_size=10)
-
-
-
-
-def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, cluster_method: str, model: str, categories):
+def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, cluster_method: str, model: str, categories: list, sample: int):
     """
     Path is the root directory of the training data
     """
@@ -200,10 +196,13 @@ def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, clust
             f"{(collection_sizes[col]['size'] / dataset_size) * 100:.02f}% | {collection_sizes[col]['processed']} of {collection_sizes[col]['total']} processed | {collection_sizes[col]['documents']} docs"
         )
 
+    json_sample = random.sample(jsons, sample)
     # now that we have a small subset of jsons we do the analysis with an LLM to start
     if cluster_method == "llm":
-        cluster_with_argo(jsons, model, )
-
+        results = cluster_with_argo(jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"])
+        with open("output.txt", 'w') as out:
+           for result in results:
+               out.write(result + "\n")
 
 
 def get_json_paths(root: Path, subset: list):
@@ -234,7 +233,9 @@ if __name__ == "__main__":
     parser.add_argument("--subset", action="append", help="Data subset to process", choices=["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"], default=[])
     parser.add_argument("--threads", help="Number of processes", default=1)
     parser.add_argument("--cluster-method", help="The method of clustering to use.", choices=["llm", "transformer"], default="llm")
-    parser.add_argument("--model", help="Available Argo model to use", choices=["gpt-4o-mini"] default="gpt-4o-mini")
+    parser.add_argument("--model", help="Available Argo model to use", choices=["gpt-4o-mini"], default="gpt-4o-mini")
+    parser.add_argument("--sample", help="The number of documents to sample.", default="100")
+    parser.add_argument("--categories", action="append", help="Classification categories.", default=["Beginner", "Intermediate", "Advanced", "Expert"])
 
     args = parser.parse_args()
-    get_corpus_metadata(Path(args.data), args.units, args.subset, int(args.threads), args.cluster_method, args.model)
+    get_corpus_metadata(Path(args.data), args.units, args.subset, int(args.threads), args.cluster_method, args.model, args.categories, int(args.sample))
