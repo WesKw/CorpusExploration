@@ -4,11 +4,11 @@ import openai
 import gzip
 import os
 import subprocess
-import shutil
 import math
 import multiprocessing
 import zstandard as zstd
 import random
+import inference_auth_token
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -96,6 +96,7 @@ def process_json_file(path: str):
         while pos < len(data) and data[pos] in ' \t\n\r':
             pos += 1
         jsons.append(value)
+        # print(value.keys())
         
     return (path, collection, bytes, documents, jsons)
     # print(f"\033[K{json}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
@@ -110,13 +111,20 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
     Use predefined labels to cluster documents according to labels. Otherwise
     the LLM will cluster based on similarity
     """
+    # get authentication token
+    # print("Documents:", jsons)
+    print(f"Clustering sample-size: {len(jsons)}")
+    token = inference_auth_token.get_access_token()
+    print("Current token:", token)
+
     client = openai.OpenAI(
-        base_url="https://apps.inside.anl.gov/argoapi/api/v1/chat/openai/v1",
-        api_key=os.environ["OPEN_AI_KEY"]
+        base_url="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1",
+        api_key=token
     )
     
     # give concrete classifications for now
-    prompt = f"""You are a document classifier. Cluster documents by topic similarity, and add a content difficulty classification for each document into one of: {categories}. Respond ONLY with a JSON array: [{{"id": "<id>", "category": "<category>", "confidence": "<high|medium|low>", "difficulty": "<content_difficulty>"}}]"""
+    # todo:: include the subsection of data that the document is from
+    prompt = f"""You are a document classifier. Cluster documents by topic similarity (top 3 topics with probabilities), and add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0 and 1, 0 is no prior knowledge and 1 is high domain knowledge. Respond ONLY with a JSON array: [{{"title": "<title>", "<category1>": "<probability>", "<category2>": "<probability>", "<category3>": "<probability>", "confidence": "<high|medium|low>", "difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "language": "<language>"}}]"""
     all_results = []
         
     for i in range(0, len(jsons), batch_size):
@@ -126,7 +134,7 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
         doc_texts = []
         for doc in batch:
             # documents don't have titles, though all the jsons have a Text attribute
-            doc_texts.append(f"[Content: {doc.get('Text', '')[:300]}")
+            doc_texts.append(f"[Content: {doc.get('text', '')[:300]}")
 
         response = client.chat.completions.create(
             model=model,
@@ -140,12 +148,13 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
                     "role": "user",
                     "content": "\n\n".join(doc_texts)
                 }
-            ]
+            ],
+
         )
         
-        if response.choices[0].message.content:
-            batch_results = json.loads(response.choices[0].message.content)
-            all_results.extend(batch_results)
+        # if response.choices[0].message.content:
+        batch_results = json.loads(response.choices[0].message.content)
+        all_results.extend(batch_results)
         
         print(f"Processed batch {i // batch_size + 1} "
             f"({len(all_results)}/{len(jsons)} docs)")
@@ -196,13 +205,16 @@ def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, clust
             f"{(collection_sizes[col]['size'] / dataset_size) * 100:.02f}% | {collection_sizes[col]['processed']} of {collection_sizes[col]['total']} processed | {collection_sizes[col]['documents']} docs"
         )
 
-    json_sample = random.sample(jsons, sample)
+    # json_sample = random.sample(jsons, sample)
     # now that we have a small subset of jsons we do the analysis with an LLM to start
     if cluster_method == "llm":
-        results = cluster_with_argo(jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"])
+        results = cluster_with_argo(random.sample(jsons, sample), model, ["Beginner", "Intermediate", "Advanced", "Expert"])
         with open("output.txt", 'w') as out:
            for result in results:
-               out.write(result + "\n")
+                try:
+                   out.write(json.dumps(result) + "\n")
+                except Exception as exc:
+                   print(exc)
 
 
 def get_json_paths(root: Path, subset: list):
@@ -233,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument("--subset", action="append", help="Data subset to process", choices=["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"], default=[])
     parser.add_argument("--threads", help="Number of processes", default=1)
     parser.add_argument("--cluster-method", help="The method of clustering to use.", choices=["llm", "transformer"], default="llm")
-    parser.add_argument("--model", help="Available Argo model to use", choices=["gpt-4o-mini"], default="gpt-4o-mini")
+    parser.add_argument("--model", help="Available model to use", choices=["openai/gpt-oss-120b", "google/gemma-4-26B-A4B-it"], default="openai/gpt-oss-120b")
     parser.add_argument("--sample", help="The number of documents to sample.", default="100")
     parser.add_argument("--categories", action="append", help="Classification categories.", default=["Beginner", "Intermediate", "Advanced", "Expert"])
 
