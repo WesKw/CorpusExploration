@@ -7,8 +7,12 @@ prompts:
 Can you include some code for a undirected graph visualization 
 to see exactly how close documents are to each other?
 
-2) Hi Claude the document similarity graph is unreadable with >=1000 documents
+2)
+Hi Claude the document similarity graph is unreadable with >=1000 documents
 [includes image of unreadable graph]
+
+3)
+Looks good. Can you draw circles around the clusters and label them with the primary category?
 
 document_similarity_graph.py
 
@@ -25,7 +29,9 @@ to ForceAtlas2 (much better at separating clusters than spring layout at
 scale), node/edge sizing shrinks automatically as the document count grows,
 and labels are reduced to one representative title per detected community
 once there are more documents than would fit legibly - rather than printing
-every single title on top of each other.
+every single title on top of each other. A dashed circle is drawn around
+each detected cluster and labeled with its primary category (the category
+most often the top pick among that cluster's documents).
 
 Requires: networkx, matplotlib, numpy
 Reuses the JSON loading/parsing from visualize_clusters.py (keep both files
@@ -37,10 +43,13 @@ Usage:
     python document_similarity_graph.py records.json --method threshold --threshold 0.2
     python document_similarity_graph.py records.json --color-by community
     python document_similarity_graph.py records.json --max-labels 60
+    python document_similarity_graph.py records.json --no-cluster-circles
+    python document_similarity_graph.py records.json --min-circle-size 5
 """
 
 import argparse
 import textwrap
+from collections import Counter, defaultdict
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -51,14 +60,6 @@ from visualize_clusters import (
     load_records,
     parse_records,
 )
-
-# Sequential color scale for difficulty (ordinal: beginner -> expert)
-DIFFICULTY_COLORS = {
-    "beginner": "#cfe8ff",
-    "intermediate": "#7fb8e8",
-    "advanced": "#3a78b5",
-    "expert": "#0d2c54",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,7 @@ def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
             difficulty=p["difficulty"],
             confidence=p["confidence"],
             prior_knowledge=p["prior_knowledge"],
+            categories=p["categories"],
         )
 
     n = len(parsed)
@@ -162,7 +164,7 @@ def compute_layout(G, layout, seed=42):
     if layout == "spring":
         return nx.spring_layout(G, weight="weight", seed=seed, k=1.2)
     return nx.forceatlas2_layout(
-        G, max_iter=150, seed=seed, weight="weight", scaling_ratio=4.0, gravity=0.6
+        G, max_iter=250, seed=seed, weight="weight", scaling_ratio=8.0, gravity=0.3
     )
 
 
@@ -173,6 +175,77 @@ def detect_communities(G):
     if G.number_of_edges() == 0:
         return [{n} for n in G.nodes]
     return list(nx.community.greedy_modularity_communities(G, weight="weight"))
+
+
+def cluster_primary_category(G, members):
+    """The category that best represents a cluster: whichever category is
+    most often each member's own top (highest-probability) category, with
+    ties broken by summed probability."""
+    counts = Counter()
+    prob_sum = defaultdict(float)
+    for node in members:
+        cats = G.nodes[node].get("categories") or {}
+        if not cats:
+            continue
+        name, prob = next(iter(cats.items()))  # already sorted desc by probability
+        counts[name] += 1
+        prob_sum[name] += prob
+    if not counts:
+        return None
+    top_count = max(counts.values())
+    candidates = [name for name, c in counts.items() if c == top_count]
+    return candidates[0] if len(candidates) == 1 else max(candidates, key=lambda n: prob_sum[n])
+
+
+def compute_cluster_circles(G, pos, communities, min_size=3, spread_percentile=75):
+    """One circle per community with at least `min_size` members: centered
+    on the member centroid, sized to cover most members (a percentile,
+    rather than the absolute max, so a single stray node doesn't blow the
+    circle up) with a little padding, and labeled with the cluster's
+    primary category. Each circle carries `comm_index` - its position in
+    the original `communities` list - so callers can color it to match
+    that community's node color exactly, even though small communities
+    below `min_size` are skipped here."""
+    if not pos:
+        return []
+
+    all_pts = np.array(list(pos.values()))
+    diag = np.linalg.norm(all_pts.max(axis=0) - all_pts.min(axis=0)) if len(all_pts) > 1 else 1.0
+    floor_radius = max(diag * 0.015, 1e-6)
+
+    circles = []
+    for comm_index, comm in enumerate(communities):
+        if len(comm) < min_size:
+            continue
+        pts = np.array([pos[n] for n in comm])
+        centroid = pts.mean(axis=0)
+        dists = np.linalg.norm(pts - centroid, axis=1)
+        radius = max(np.percentile(dists, spread_percentile) * 1.08 + diag * 0.01, floor_radius)
+        category = cluster_primary_category(G, comm)
+        circles.append({
+            "comm_index": comm_index,
+            "centroid": centroid,
+            "radius": radius,
+            "label": f"{category or '(no category)'}  ({len(comm)})",
+        })
+    return circles
+
+
+def draw_cluster_circles(ax, circles, cmap):
+    """Draws largest circles first so smaller, more specific clusters and
+    their labels stay visible on top instead of being buried."""
+    for c in sorted(circles, key=lambda c: c["radius"], reverse=True):
+        color = cmap(c["comm_index"] % 20)
+        circle = plt.Circle(c["centroid"], c["radius"], fill=False, linestyle="--",
+                            linewidth=1.4, edgecolor=color, alpha=0.9, zorder=1)
+        ax.add_patch(circle)
+        label_xy = (c["centroid"][0], c["centroid"][1] + c["radius"])
+        ax.annotate(
+            c["label"], xy=label_xy, ha="center", va="bottom", fontsize=8.5,
+            fontweight="bold", color=color,
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="none", alpha=0.8),
+            zorder=5,
+        )
 
 
 def get_node_colors(G, communities, color_by):
@@ -192,14 +265,18 @@ _DIFFICULTY_COLORS = {
 }
 
 
-def select_labels(G, communities, max_labels):
+def select_labels(G, communities, max_labels, circles_enabled):
     """Small graphs: label every document, same as before. Large graphs:
-    one representative (highest-degree) document per community, largest
-    communities first, capped at max_labels - this is what keeps thousands
-    of overlapping titles from turning the plot into black scribble."""
+    if cluster circles are being drawn, their category labels already
+    identify each cluster, so per-node labels are skipped entirely to avoid
+    redundant clutter. If circles are disabled, fall back to one
+    representative (highest-degree) document title per community instead."""
     n = G.number_of_nodes()
     if n <= max_labels:
         return {node: truncate(G.nodes[node]["title"]) for node in G.nodes}
+
+    if circles_enabled:
+        return {}
 
     strength = dict(G.degree(weight="weight"))
     labels = {}
@@ -214,7 +291,7 @@ def select_labels(G, communities, max_labels):
 
 
 def plot_graph(G, ax, layout="forceatlas2", color_by="auto", max_labels=40,
-               show_weights=False):
+               show_weights=False, cluster_circles=True, min_circle_size=3):
     if G.number_of_nodes() == 0:
         ax.axis("off")
         ax.set_title("No documents to display")
@@ -226,6 +303,10 @@ def plot_graph(G, ax, layout="forceatlas2", color_by="auto", max_labels=40,
     pos = compute_layout(G, layout)
     communities = detect_communities(G)
     node_colors = get_node_colors(G, communities, color_by)
+
+    if cluster_circles:
+        circles = compute_cluster_circles(G, pos, communities, min_size=min_circle_size)
+        draw_cluster_circles(ax, circles, cmap=plt.colormaps["tab20"])
 
     # Node/edge sizing shrinks as the document count grows, so a few hundred
     # documents don't render as one solid mass of overlapping circles.
@@ -247,7 +328,7 @@ def plot_graph(G, ax, layout="forceatlas2", color_by="auto", max_labels=40,
         edgecolors="white", linewidths=0.4 if n <= max_labels else 0,
     )
 
-    labels = select_labels(G, communities, max_labels)
+    labels = select_labels(G, communities, max_labels, circles_enabled=cluster_circles)
     font_size = 7.5 if n <= max_labels else 8
     font_weight = "normal" if n <= max_labels else "bold"
     nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=font_size,
@@ -280,7 +361,7 @@ def plot_graph(G, ax, layout="forceatlas2", color_by="auto", max_labels=40,
 
 def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
                             layout="forceatlas2", color_by="auto", max_labels=40,
-                            show_weights=False):
+                            show_weights=False, cluster_circles=True, min_circle_size=3):
     vocab = build_vocab(parsed)
     if not vocab:
         raise SystemExit("No category names found in the input - can't compute similarity.")
@@ -302,7 +383,8 @@ def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
     fig_size = 12 if G.number_of_nodes() <= max_labels else 16
     fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.85))
     plot_graph(G, ax, layout=layout, color_by=color_by, max_labels=max_labels,
-              show_weights=show_weights)
+              show_weights=show_weights, cluster_circles=cluster_circles,
+              min_circle_size=min_circle_size)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -340,6 +422,11 @@ def main():
                              "instead of every title")
     parser.add_argument("--show-weights", action="store_true",
                         help="Annotate edges with their similarity score (small graphs only)")
+    parser.add_argument("--no-cluster-circles", action="store_true",
+                        help="Disable the dashed circles drawn around each detected "
+                             "cluster (labeled with its primary category)")
+    parser.add_argument("--min-circle-size", type=int, default=3,
+                        help="Minimum cluster size to draw a circle around (default 3)")
     args = parser.parse_args()
 
     records = load_records(args.json_path)
@@ -351,7 +438,8 @@ def main():
     build_similarity_figure(
         parsed, args.out, method=args.method, threshold=args.threshold, k=args.k,
         layout=args.layout, color_by=args.color_by, max_labels=args.max_labels,
-        show_weights=args.show_weights,
+        show_weights=args.show_weights, cluster_circles=not args.no_cluster_circles,
+        min_circle_size=args.min_circle_size,
     )
 
 
