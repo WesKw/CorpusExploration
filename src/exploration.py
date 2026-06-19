@@ -2,7 +2,6 @@ import time
 import json
 import openai
 import gzip
-import os
 import subprocess
 import math
 import multiprocessing
@@ -23,6 +22,9 @@ UNIT_CHOICES = {
     "GB": math.pow(1024, 3),
     "TB": math.pow(1024, 4),
 }
+
+# need a maximum length due to rate limiting
+MAX_DOCUMENT_LENGTH=5000
 
 
 def process_json_file(args):
@@ -118,7 +120,7 @@ def process_json_file(args):
     # os.remove(f"./{path.name.replace('.gz', '')}")
 
 
-def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size: int=10, delay: float=1.0):
+def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size: int=10, delay: float=1.0, temperature: float=0.2):
     """
     Use predefined labels to cluster documents according to labels. Otherwise
     the LLM will cluster based on similarity
@@ -136,7 +138,7 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
     
     # give concrete classifications for now
     # todo:: include the subsection of data that the document is from
-    prompt = f"""You are a document classifier. Cluster documents by topic similarity (top 3 topics with probabilities), and add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0 and 1, 0 is no prior knowledge and 1 is high domain knowledge. Ensure the order of the output is the same as the input order. Respond ONLY with a JSON array: [{{"title": "<title>", "<category1>": "<probability>", "<category2>": "<probability>", "<category3>": "<probability>", "confidence": "<high|medium|low>", "difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "language": "<language>"}}]"""
+    prompt = f"""You are a document classifier. Cluster documents by topic similarity (top 3 topics with probabilities), and add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0 and 1, 0 is no prior knowledge and 1 is high domain knowledge. Include the number of white space separated tokens in the document. Respond ONLY with a JSON array: [{{"title": "<title>", "<category1>": "<probability>", "<category2>": "<probability>", "<category3>": "<probability>", "confidence": "<high|medium|low>", "difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "language": "<language>": "tokens": "<number_of_tokens>"}}]"""
     all_results = []
         
     for i in range(0, len(jsons), batch_size):
@@ -146,11 +148,11 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
         doc_texts = []
         for doc in batch:
             # documents don't have titles, though all the jsons have a Text attribute
-            doc_texts.append(f"[Content: {doc.get('text', '')[:300]}")
+            doc_texts.append(f"[Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
 
         response = client.chat.completions.create(
             model=model,
-            temperature=0,
+            temperature=temperature,
             messages=[
                 {
                     "role": "system",
@@ -166,12 +168,13 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
         
         # if response.choices[0].message.content:
         try:
-            batch_results = json.loads(response.choices[0].message.content, object_pairs_hook=od)
+            batch_results = json.loads(response.choices[0].message.content)
             # ordered dict retains order
             # add word counts for each document into the json
-            for idx,json in enumerate(batch):
-                ws_tokens_in_doc = len(json["text"].split())
-                list(batch_results.items())[idx]["word_count"] = ws_tokens_in_doc
+            # for idx,data in enumerate(batch):
+            #     print(data["text"])
+            #     ws_tokens_in_doc = len(data["text"].split())
+            #     list(batch_results.items())[idx]["word_count"] = ws_tokens_in_doc
 
             all_results.extend(batch_results)
         except Exception as exc:
@@ -186,7 +189,7 @@ def cluster_with_argo(jsons: list, model: str, categories: list[str], batch_size
     return all_results
 
 
-def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, cluster_method: str, model: str, categories: list, sample: int, sample_probability: float):
+def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, cluster_method: str, model: str, categories: list, sample: int, sample_probability: float|None, temperature: float):
     """
     Path is the root directory of the training data
     """
@@ -236,7 +239,7 @@ def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, clust
             jsons = random.sample(jsons, sample)
 
         print(f"Sample size: {len(jsons)}")
-        results = cluster_with_argo(jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"])
+        results = cluster_with_argo(jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"], temperature=temperature)
         with open("output.txt", 'w') as out:
            for result in results:
                 try:
@@ -276,6 +279,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample", help="The number of documents to sample.", default="100")
     parser.add_argument("--categories", action="append", help="Classification categories.", default=["Beginner", "Intermediate", "Advanced", "Expert"])
     parser.add_argument("--sample-prob", help="The probability of retaining a processed json. [0, 1]. If set, overrides the --sample argument.", default=None)
+    parser.add_argument("--temperature", help="LLM temperature", default=0.2)
 
     args = parser.parse_args()
 
@@ -286,14 +290,22 @@ if __name__ == "__main__":
     print(f"\tcluster method -> {args.cluster_method}")
     print(f"\tmodel -> {args.model}")
     print(f"\tsample probability -> {args.sample_prob}")
+
+    probability = None
+    if args.sample_prob != None:
+        probability = float(args.sample_prob)
     
     # get the corpus metadata
-    get_corpus_metadata(Path(args.data), args.units, args.subset, int(args.threads), args.cluster_method, args.model, args.categories, int(args.sample), float(args.sample_prob))
+    get_corpus_metadata(Path(args.data), args.units, args.subset, int(args.threads), args.cluster_method, args.model, args.categories, int(args.sample), probability, args.temperature)
 
     # visualize the data and save
-    subprocess.run(["python", "visualize_clusters.py", "output.txt"])
-    subprocess.run(["python", "document_similarity_graph.py", "output.txt", '--method "knn"', "--k 10"])
+    # save_dir = f"./{'-'.join(args.model.split('/'))}-clustering-{'-'.join(args.subset)}-{args.sample}-temp{args.temperature:.01f}"
+    # subprocess.run(["python", "visualize_clusters.py", "output.txt"])
+    # subprocess.run(["python", "document_similarity_graph.py", "output.txt", '--method', 'knn', "--k", "10"])
+    # subprocess.run(["mkdir", "-p", f"{save_dir}"])
+    # subprocess.run(["mv", "cluster_dashboard.png", f"{save_dir}"])
+    # subprocess.run(["mv", "similarity_graph.png", f"{save_dir}"])
+    # subprocess.run(["mv", "output.txt", f"{save_dir}"])
 
-    path = Path(f"./{args.model}-clustering-{'-'.join(args.subset)}-{args.sample}", parents=True, exist_ok=True)
-    for file in ["cluster_dashboard.png", "similarity_graph.png", "output.txt"]:
-        shutil.move(file, str(path))
+    # for file in ["cluster_dashboard.png", "similarity_graph.png", "output.txt"]:
+    #     shutil.move(file, f"./{'-'.join(args.model.split('/'))}-clustering-{'-'.join(args.subset)}-temp{args.temperature:.01f}/{file}")

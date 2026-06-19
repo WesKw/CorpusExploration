@@ -20,6 +20,10 @@ The new json format is `{
     "prior_knowledge": "<float between 0 and 1>"
 }` Please adjust the code accordingly
 
+3) 
+The new json format includes `"tokens": "<number_of_tokens>`, update the dashboard 
+to include the distribution of document sizes for each primary category
+
 visualize_clusters.py
 
 Visualizes document-cluster JSON records of the form:
@@ -31,13 +35,14 @@ Visualizes document-cluster JSON records of the form:
     "<category3>": "<probability>",
     "confidence": "<low|medium|high>",
     "difficulty": "<beginner|intermediate|advanced|expert>",
-    "prior_knowledge": "<float between 0 and 1>"
+    "prior_knowledge": "<float between 0 and 1>",
+    "tokens": "<number_of_tokens>"
 }
 
 Category names are now arbitrary JSON keys (e.g. "machine_learning": "0.82")
 rather than fixed "category1"/"category2"/"category3" fields. Any key that
-isn't title/confidence/difficulty/prior_knowledge is treated as a category,
-and a document can have any number of them - not just 3.
+isn't title/confidence/difficulty/prior_knowledge/tokens is treated as a
+category, and a document can have any number of them - not just 3.
 
 Input file can be:
   - a JSON array of such records, or
@@ -63,7 +68,7 @@ DIFFICULTY_ORDER = ["beginner", "intermediate", "advanced", "expert"]
 CONFIDENCE_COLORS = {"low": "#E07B54", "medium": "#F2C14E", "high": "#5B8C5A"}
 
 # Every other key on a record is treated as "<category_name>": "<probability>"
-RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge"}
+RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens"}
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +108,17 @@ def parse_probability(value):
         return None
 
 
+def parse_int(value):
+    """Coerce a count field (often a string, sometimes "1234.0") into an
+    int, or None."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_records(records):
     """Turn raw JSON records into a flat list of dicts ready for plotting.
 
@@ -116,6 +132,7 @@ def parse_records(records):
             "confidence": (r.get("confidence") or "unknown").lower(),
             "difficulty": (r.get("difficulty") or "unknown").lower(),
             "prior_knowledge": parse_probability(r.get("prior_knowledge")),
+            "tokens": parse_int(r.get("tokens")),
         }
 
         categories = {}
@@ -123,8 +140,9 @@ def parse_records(records):
             if key in RESERVED_KEYS:
                 continue
             prob = parse_probability(value)
+            # key categories should all have the same formatting to avoid issues
             if prob is not None:
-                categories[key] = prob
+                categories[key.lower()] = prob
 
         item["categories"] = dict(
             sorted(categories.items(), key=lambda kv: kv[1], reverse=True)
@@ -151,12 +169,20 @@ def top_category(item):
 # Individual panel plots
 # ---------------------------------------------------------------------------
 
-def plot_top_categories(parsed, ax, top_n=10):
+def primary_category_counts(parsed):
+    """How many documents have each category as their top (highest
+    probability) pick. Shared by the bar chart and the token-length panel
+    so both agree on which categories are "top" and in what order."""
     counter = Counter()
     for p in parsed:
         name, _ = top_category(p)
         if name:
             counter[name] += 1
+    return counter
+
+
+def plot_top_categories(parsed, ax, top_n=10):
+    counter = primary_category_counts(parsed)
     common = counter.most_common(top_n)
     if not common:
         ax.axis("off")
@@ -242,15 +268,48 @@ def plot_category_probability_box(parsed, ax, max_ranks=5):
     ax.set_title("Probability spread by category rank\n(rank 1 = each doc's top category)")
 
 
+def plot_tokens_by_category(parsed, ax, top_n=10):
+    """Box-plots document length (tokens) for each of the most common
+    primary categories, so you can see e.g. whether "history" articles run
+    much longer than "mathematics" articles. Uses the same top-N category
+    selection/order as plot_top_categories for easy cross-reference."""
+    counter = primary_category_counts(parsed)
+    top_names = [name for name, _ in counter.most_common(top_n)]
+
+    # Precompute (top category, tokens) once per doc rather than re-deriving
+    # top_category() inside a nested loop over every candidate category.
+    doc_top_tokens = [(top_category(p)[0], p["tokens"]) for p in parsed]
+
+    data, labels = [], []
+    for name in top_names:
+        vals = [tok for cat, tok in doc_top_tokens if cat == name and tok is not None]
+        if vals:
+            data.append(vals)
+            labels.append(name)
+
+    if not data:
+        ax.axis("off")
+        return
+    try:
+        ax.boxplot(data, tick_labels=labels, vert=False)  # matplotlib >= 3.9
+    except TypeError:
+        ax.boxplot(data, labels=labels, vert=False)  # matplotlib < 3.9
+    ax.invert_yaxis()  # largest/most common category on top, matching the bar chart
+    ax.set_xlabel("Tokens (document length)")
+    ax.set_title(f"Document length by top {len(labels)} categories")
+
+
 def plot_summary_text(parsed, ax):
     ax.axis("off")
     n = len(parsed)
     avg_pk = np.mean([p["prior_knowledge"] for p in parsed if p["prior_knowledge"] is not None])
+    avg_tokens = np.mean([p["tokens"] for p in parsed if p["tokens"] is not None])
     n_categories = len({top_category(p)[0] for p in parsed if top_category(p)[0]})
     lines = [
         f"Documents: {n}",
         f"Distinct primary categories: {n_categories}",
         f"Avg. prior knowledge: {avg_pk:.2f}" if not np.isnan(avg_pk) else "Avg. prior knowledge: n/a",
+        f"Avg. tokens: {avg_tokens:.0f}" if not np.isnan(avg_tokens) else "Avg. tokens: n/a",
     ]
     ax.text(0.05, 0.8, "\n".join(lines), fontsize=12, va="top",
             family="monospace", transform=ax.transAxes)
@@ -262,14 +321,16 @@ def plot_summary_text(parsed, ax):
 # ---------------------------------------------------------------------------
 
 def build_dashboard(parsed, out_path):
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
 
     plot_top_categories(parsed, axes[0, 0])
     plot_confidence_distribution(parsed, axes[0, 1])
     plot_difficulty_distribution(parsed, axes[0, 2])
+    plot_tokens_by_category(parsed, axes[0, 3])
     plot_prior_knowledge_vs_difficulty(parsed, axes[1, 0])
     plot_category_probability_box(parsed, axes[1, 1])
     plot_summary_text(parsed, axes[1, 2])
+    axes[1, 3].axis("off")
 
     fig.suptitle("Document Cluster Overview", fontsize=16, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
