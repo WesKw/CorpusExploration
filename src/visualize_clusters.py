@@ -24,6 +24,9 @@ The new json format is `{
 The new json format includes `"tokens": "<number_of_tokens>`, update the dashboard 
 to include the distribution of document sizes for each primary category
 
+4) 
+Can you update `visualize_clusters.py` to plot the distribution of difficulties for each category?
+
 visualize_clusters.py
 
 Visualizes document-cluster JSON records of the form:
@@ -66,6 +69,15 @@ CONFIDENCE_ORDER = ["low", "medium", "high"]
 DIFFICULTY_ORDER = ["beginner", "intermediate", "advanced", "expert"]
 
 CONFIDENCE_COLORS = {"low": "#E07B54", "medium": "#F2C14E", "high": "#5B8C5A"}
+
+# Sequential color scale for difficulty (ordinal: beginner -> expert). Shared
+# by the overall difficulty bar chart and the per-category breakdown below.
+DIFFICULTY_COLORS = {
+    "beginner": "#cfe8ff",
+    "intermediate": "#7fb8e8",
+    "advanced": "#3a78b5",
+    "expert": "#0d2c54",
+}
 
 # Every other key on a record is treated as "<category_name>": "<probability>"
 RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens"}
@@ -133,6 +145,7 @@ def parse_records(records):
             "difficulty": (r.get("difficulty") or "unknown").lower(),
             "prior_knowledge": parse_probability(r.get("prior_knowledge")),
             "tokens": parse_int(r.get("tokens")),
+            "location": r.get("location", "")
         }
 
         categories = {}
@@ -140,9 +153,8 @@ def parse_records(records):
             if key in RESERVED_KEYS:
                 continue
             prob = parse_probability(value)
-            # key categories should all have the same formatting to avoid issues
             if prob is not None:
-                categories[key.lower()] = prob
+                categories[key] = prob
 
         item["categories"] = dict(
             sorted(categories.items(), key=lambda kv: kv[1], reverse=True)
@@ -213,7 +225,8 @@ def plot_difficulty_distribution(parsed, ax):
     order = [d for d in DIFFICULTY_ORDER if d in counter]
     order += [d for d in counter if d not in DIFFICULTY_ORDER]
     counts = [counter[d] for d in order]
-    ax.bar(order, counts, color="#7B6D8D")
+    colors = [DIFFICULTY_COLORS.get(d, "#999999") for d in order]
+    ax.bar(order, counts, color=colors)
     ax.set_title("Difficulty distribution")
     ax.set_ylabel("Document count")
     ax.tick_params(axis="x", rotation=20)
@@ -299,6 +312,56 @@ def plot_tokens_by_category(parsed, ax, top_n=10):
     ax.set_title(f"Document length by top {len(labels)} categories")
 
 
+def plot_difficulty_by_category(parsed, ax, top_n=10):
+    """100%-stacked horizontal bars: for each of the most common primary
+    categories, what share of its documents are beginner/intermediate/
+    advanced/expert. Normalized per-category (each bar sums to 100%)
+    rather than raw counts, since the question is "what's the difficulty
+    mix *within* this category", not how many documents it has overall
+    (that's already covered by plot_top_categories). Uses the same top-N
+    category selection/order as plot_top_categories for cross-reference."""
+    counter = primary_category_counts(parsed)
+    top_names = [name for name, _ in counter.most_common(top_n)]
+
+    doc_top_difficulty = [(top_category(p)[0], p["difficulty"]) for p in parsed]
+
+    rows = []
+    for name in top_names:
+        diffs = [d for cat, d in doc_top_difficulty if cat == name]
+        if not diffs:
+            continue
+        diff_counts = Counter(diffs)
+        total = len(diffs)
+        shares = [diff_counts.get(d, 0) / total for d in DIFFICULTY_ORDER]
+        rows.append((name, shares, total))
+
+    if not rows:
+        ax.axis("off")
+        return
+
+    names = [r[0] for r in rows]
+    totals = [r[2] for r in rows]
+    y = np.arange(len(names))
+    left = np.zeros(len(names))
+    for i, d in enumerate(DIFFICULTY_ORDER):
+        widths = np.array([r[1][i] for r in rows])
+        ax.barh(y, widths, left=left, color=DIFFICULTY_COLORS.get(d, "#999999"),
+                label=d, height=0.7)
+        left += widths
+
+    for yi, total in zip(y, totals):
+        ax.text(1.02, yi, f"n={total}", va="center", fontsize=7, transform=ax.get_yaxis_transform())
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(names)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Share of documents")
+    ax.set_title(f"Difficulty mix within top {len(names)} categories")
+    ax.legend(title="Difficulty", fontsize=7, loc="lower left",
+              bbox_to_anchor=(0, -0.32), ncol=4, framealpha=0.9)
+
+
 def plot_summary_text(parsed, ax):
     ax.axis("off")
     n = len(parsed)
@@ -330,7 +393,7 @@ def build_dashboard(parsed, out_path):
     plot_prior_knowledge_vs_difficulty(parsed, axes[1, 0])
     plot_category_probability_box(parsed, axes[1, 1])
     plot_summary_text(parsed, axes[1, 2])
-    axes[1, 3].axis("off")
+    plot_difficulty_by_category(parsed, axes[1, 3])
 
     fig.suptitle("Document Cluster Overview", fontsize=16, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])

@@ -14,18 +14,27 @@ Hi Claude the document similarity graph is unreadable with >=1000 documents
 3)
 Looks good. Can you draw circles around the clusters and label them with the primary category?
 
+4) 
+Can you modify document_similarity_graph.py to use plotly instead of matplotlib for more interactibility?
+
 document_similarity_graph.py
 
-Builds an undirected graph showing how "close" documents are to one another,
-based on the categories (and probabilities) assigned to each document by the
-clustering pipeline. Categories are dynamic JSON keys (e.g.
+Builds an interactive undirected graph showing how "close" documents are to
+one another, based on the categories (and probabilities) assigned to each
+document by the clustering pipeline. Categories are dynamic JSON keys (e.g.
 "machine_learning": "0.82") rather than fixed category1/2/3 fields, and a
 document can have any number of them. Two documents are considered close if
 they share categories with similar weight - this is measured with cosine
 similarity over a "category vector" for each document.
 
-Scales from a handful of documents up to several thousand: layout switches
-to ForceAtlas2 (much better at separating clusters than spring layout at
+Renders with Plotly instead of matplotlib, so the output is a self-contained
+HTML file you can open in a browser: scroll to zoom, drag to pan, hover any
+document for its title/categories/difficulty/confidence/prior knowledge/
+token count, and click a legend entry to toggle that community or difficulty
+level on/off.
+
+Scales from a handful of documents up to several thousand: layout uses
+ForceAtlas2 (much better at separating clusters than spring layout at
 scale), node/edge sizing shrinks automatically as the document count grows,
 and labels are reduced to one representative title per detected community
 once there are more documents than would fit legibly - rather than printing
@@ -33,7 +42,7 @@ every single title on top of each other. A dashed circle is drawn around
 each detected cluster and labeled with its primary category (the category
 most often the top pick among that cluster's documents).
 
-Requires: networkx, matplotlib, numpy
+Requires: networkx, plotly, numpy
 Reuses the JSON loading/parsing from visualize_clusters.py (keep both files
 in the same folder).
 
@@ -45,21 +54,36 @@ Usage:
     python document_similarity_graph.py records.json --max-labels 60
     python document_similarity_graph.py records.json --no-cluster-circles
     python document_similarity_graph.py records.json --min-circle-size 5
+    python document_similarity_graph.py records.json --show-weights
+    python document_similarity_graph.py records.json --cdn   # smaller file, needs internet to view
 """
 
 import argparse
 import textwrap
 from collections import Counter, defaultdict
 
-import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import plotly.colors as pc
+import plotly.graph_objects as go
 
 from visualize_clusters import (
     DIFFICULTY_ORDER,
     load_records,
     parse_records,
 )
+
+# Sequential color scale for difficulty (ordinal: beginner -> expert)
+_DIFFICULTY_COLORS = {
+    "beginner": "#cfe8ff",
+    "intermediate": "#7fb8e8",
+    "advanced": "#3a78b5",
+    "expert": "#0d2c54",
+}
+
+# Qualitative palette for community coloring - 24 visually distinct colors,
+# cycled with modulo if there are more communities than that.
+_COMMUNITY_PALETTE = pc.qualitative.Dark24
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +146,7 @@ def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
             difficulty=p["difficulty"],
             confidence=p["confidence"],
             prior_knowledge=p["prior_knowledge"],
+            tokens=p.get("tokens"),
             categories=p["categories"],
         )
 
@@ -147,7 +172,8 @@ def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
 
 
 # ---------------------------------------------------------------------------
-# Plotting
+# Layout & community detection (unchanged from the matplotlib version -
+# networkx positions are just (x, y) coordinates, equally usable by Plotly)
 # ---------------------------------------------------------------------------
 
 def truncate(text, width=22):
@@ -231,137 +257,211 @@ def compute_cluster_circles(G, pos, communities, min_size=3, spread_percentile=7
     return circles
 
 
-def draw_cluster_circles(ax, circles, cmap):
-    """Draws largest circles first so smaller, more specific clusters and
-    their labels stay visible on top instead of being buried."""
+# ---------------------------------------------------------------------------
+# Plotly rendering
+# ---------------------------------------------------------------------------
+
+def node_hover_text(G, node):
+    title = G.nodes[node]["title"]
+    cats = G.nodes[node].get("categories") or {}
+    cat_lines = "<br>".join(f"&nbsp;&nbsp;{name}: {prob:.2f}" for name, prob in list(cats.items())[:4])
+    pk = G.nodes[node]["prior_knowledge"]
+    pk_str = f"{pk:.2f}" if pk is not None else "n/a"
+    tokens = G.nodes[node].get("tokens")
+    tokens_str = f"{tokens:,}" if tokens is not None else "n/a"
+    return (
+        f"<b>{title}</b><br>"
+        f"Categories:<br>{cat_lines or '&nbsp;&nbsp;(none)'}<br>"
+        f"Difficulty: {G.nodes[node]['difficulty']}<br>"
+        f"Confidence: {G.nodes[node]['confidence']}<br>"
+        f"Prior knowledge: {pk_str}<br>"
+        f"Tokens: {tokens_str}"
+    )
+
+
+def node_size(G, node, n_nodes):
+    """Marker diameter shrinks as the document count grows, so a few
+    hundred documents don't render as one solid mass of overlapping dots."""
+    size_scale = max(4, min(34, 700 / n_nodes))
+    pk = G.nodes[node]["prior_knowledge"]
+    return size_scale * (0.7 + (pk if pk is not None else 0.3))
+
+
+def build_node_traces(G, communities, pos, color_by, max_labels):
+    """One Plotly trace per color group (community or difficulty level)
+    rather than one trace for the whole graph - this is what makes legend
+    entries clickable to isolate/hide a given cluster or difficulty level,
+    a level of interactivity a static matplotlib plot can't offer."""
+    n = G.number_of_nodes()
+    show_text = n <= max_labels
+
+    if color_by == "community":
+        groups = [(ci, list(comm)) for ci, comm in enumerate(communities) if comm]
+        def color_for(key):
+            return _COMMUNITY_PALETTE[key % len(_COMMUNITY_PALETTE)]
+        def name_for(key, nodes):
+            cat = cluster_primary_category(G, nodes)
+            return f"{cat or 'misc'} ({len(nodes)})"
+    else:
+        buckets = {d: [] for d in DIFFICULTY_ORDER}
+        for node in G.nodes:
+            buckets.setdefault(G.nodes[node]["difficulty"], []).append(node)
+        groups = [(key, nodes) for key, nodes in buckets.items() if nodes]
+        def color_for(key):
+            return _DIFFICULTY_COLORS.get(key, "#999999")
+        def name_for(key, nodes):
+            return key
+
+    traces = []
+    for key, nodes in groups:
+        traces.append(go.Scatter(
+            x=[pos[node][0] for node in nodes],
+            y=[pos[node][1] for node in nodes],
+            mode="markers+text" if show_text else "markers",
+            text=[truncate(G.nodes[node]["title"]) for node in nodes] if show_text else None,
+            textposition="top center",
+            textfont=dict(size=8, color="#333333"),
+            marker=dict(
+                size=[node_size(G, node, n) for node in nodes],
+                color=color_for(key),
+                line=dict(width=0.6, color="white"),
+            ),
+            hovertext=[node_hover_text(G, node) for node in nodes],
+            hoverinfo="text",
+            name=str(name_for(key, nodes)),
+        ))
+    return traces
+
+
+def build_edge_traces(G, pos, n_buckets=4):
+    """Edges are bucketed into a handful of width/opacity tiers by weight
+    rather than given a literal per-edge style - Plotly traces don't support
+    per-segment width within one trace, and a separate trace per edge would
+    be far too slow to render on a graph with thousands of edges."""
+    edges = list(G.edges(data=True))
+    if not edges:
+        return []
+
+    n_nodes = G.number_of_nodes()
+    max_w = max(d["weight"] for _, _, d in edges) or 1.0
+    base_width = max(0.4, min(3.0, 250 / n_nodes))
+    base_alpha = max(0.06, min(0.5, 60 / n_nodes))
+
+    buckets = [[] for _ in range(n_buckets)]
+    for u, v, d in edges:
+        idx = min(int((d["weight"] / max_w) * n_buckets), n_buckets - 1)
+        buckets[idx].append((u, v))
+
+    traces = []
+    for i, bucket in enumerate(buckets):
+        if not bucket:
+            continue
+        xs, ys = [], []
+        for u, v in bucket:
+            xs += [pos[u][0], pos[v][0], None]
+            ys += [pos[u][1], pos[v][1], None]
+        tier = (i + 1) / n_buckets
+        width = base_width * (0.3 + 0.7 * tier)
+        alpha = base_alpha * (0.4 + 0.6 * tier)
+        traces.append(go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(width=width, color=f"rgba(90,90,90,{alpha:.3f})"),
+            hoverinfo="skip", showlegend=False,
+        ))
+    return traces
+
+
+def build_edge_hover_trace(G, pos):
+    """An invisible-ish marker at each edge's midpoint, purely so hovering
+    near an edge shows its similarity score - Plotly has no native per-
+    segment hover within a multi-segment line trace."""
+    xs, ys, texts = [], [], []
+    for u, v, d in G.edges(data=True):
+        xs.append((pos[u][0] + pos[v][0]) / 2)
+        ys.append((pos[u][1] + pos[v][1]) / 2)
+        texts.append(f"similarity: {d['weight']:.3f}")
+    return go.Scatter(
+        x=xs, y=ys, mode="markers",
+        marker=dict(size=5, color="rgba(80,80,80,0.35)"),
+        hovertext=texts, hoverinfo="text", showlegend=False,
+    )
+
+
+def add_cluster_circles(fig, G, pos, communities, min_circle_size):
+    circles = compute_cluster_circles(G, pos, communities, min_size=min_circle_size)
     for c in sorted(circles, key=lambda c: c["radius"], reverse=True):
-        color = cmap(c["comm_index"] % 20)
-        circle = plt.Circle(c["centroid"], c["radius"], fill=False, linestyle="--",
-                            linewidth=1.4, edgecolor=color, alpha=0.9, zorder=1)
-        ax.add_patch(circle)
-        label_xy = (c["centroid"][0], c["centroid"][1] + c["radius"])
-        ax.annotate(
-            c["label"], xy=label_xy, ha="center", va="bottom", fontsize=8.5,
-            fontweight="bold", color=color,
-            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="none", alpha=0.8),
-            zorder=5,
+        color = _COMMUNITY_PALETTE[c["comm_index"] % len(_COMMUNITY_PALETTE)]
+        cx, cy = c["centroid"]
+        r = c["radius"]
+        fig.add_shape(
+            type="circle", xref="x", yref="y",
+            x0=cx - r, y0=cy - r, x1=cx + r, y1=cy + r,
+            line=dict(color=color, dash="dash", width=1.5),
+            fillcolor="rgba(0,0,0,0)",
+        )
+        fig.add_annotation(
+            x=cx, y=cy + r, text=f"<b>{c['label']}</b>", showarrow=False,
+            font=dict(color=color, size=11), yshift=10,
+            bgcolor="rgba(255,255,255,0.85)",
         )
 
 
-def get_node_colors(G, communities, color_by):
-    if color_by == "community":
-        node_to_comm = {n: ci for ci, comm in enumerate(communities) for n in comm}
-        cmap = plt.colormaps["tab20"]
-        return [cmap(node_to_comm[n] % 20) for n in G.nodes]
-    return [_DIFFICULTY_COLORS.get(G.nodes[n]["difficulty"], "#999999") for n in G.nodes]
-
-
-# Sequential color scale for difficulty (ordinal: beginner -> expert)
-_DIFFICULTY_COLORS = {
-    "beginner": "#cfe8ff",
-    "intermediate": "#7fb8e8",
-    "advanced": "#3a78b5",
-    "expert": "#0d2c54",
-}
-
-
-def select_labels(G, communities, max_labels, circles_enabled):
-    """Small graphs: label every document, same as before. Large graphs:
-    if cluster circles are being drawn, their category labels already
-    identify each cluster, so per-node labels are skipped entirely to avoid
-    redundant clutter. If circles are disabled, fall back to one
-    representative (highest-degree) document title per community instead."""
-    n = G.number_of_nodes()
-    if n <= max_labels:
-        return {node: truncate(G.nodes[node]["title"]) for node in G.nodes}
-
-    if circles_enabled:
-        return {}
-
-    strength = dict(G.degree(weight="weight"))
-    labels = {}
-    for comm in sorted(communities, key=len, reverse=True):
-        if len(labels) >= max_labels:
-            break
-        if len(comm) < 2:
-            continue  # skip singleton/isolated "communities" - too many to be useful
-        rep = max(comm, key=lambda node: strength[node])
-        labels[rep] = f"{truncate(G.nodes[rep]['title'])}  ({len(comm)})"
-    return labels
-
-
-def plot_graph(G, ax, layout="forceatlas2", color_by="auto", max_labels=40,
-               show_weights=False, cluster_circles=True, min_circle_size=3):
+def build_figure(G, layout="forceatlas2", color_by="auto", max_labels=40,
+                 show_weights=False, cluster_circles=True, min_circle_size=3):
     if G.number_of_nodes() == 0:
-        ax.axis("off")
-        ax.set_title("No documents to display")
-        return
+        fig = go.Figure()
+        fig.update_layout(annotations=[dict(text="No documents to display",
+                                            showarrow=False, font=dict(size=16))])
+        return fig
 
     n = G.number_of_nodes()
     color_by = ("community" if n > max_labels else "difficulty") if color_by == "auto" else color_by
 
     pos = compute_layout(G, layout)
     communities = detect_communities(G)
-    node_colors = get_node_colors(G, communities, color_by)
 
-    if cluster_circles:
-        circles = compute_cluster_circles(G, pos, communities, min_size=min_circle_size)
-        draw_cluster_circles(ax, circles, cmap=plt.colormaps["tab20"])
-
-    # Node/edge sizing shrinks as the document count grows, so a few hundred
-    # documents don't render as one solid mass of overlapping circles.
-    size_scale = max(10, min(300, 2500 / n))
-    pk_values = [G.nodes[node]["prior_knowledge"] for node in G.nodes]
-    node_sizes = [size_scale * (0.6 + (v if v is not None else 0.3)) for v in pk_values]
-
-    width_scale = max(0.2, min(4.0, 300 / n))
-    edge_weights = [G.edges[e]["weight"] for e in G.edges]
-    max_w = max(edge_weights) if edge_weights else 1.0
-    edge_widths = [width_scale * (0.2 + 0.8 * (w / max_w)) for w in edge_weights]
-    edge_alpha = max(0.08, min(0.6, 60 / n))
-
-    nx.draw_networkx_edges(
-        G, pos, ax=ax, width=edge_widths, alpha=edge_alpha, edge_color="#555555"
-    )
-    nx.draw_networkx_nodes(
-        G, pos, ax=ax, node_color=node_colors, node_size=node_sizes,
-        edgecolors="white", linewidths=0.4 if n <= max_labels else 0,
-    )
-
-    labels = select_labels(G, communities, max_labels, circles_enabled=cluster_circles)
-    font_size = 7.5 if n <= max_labels else 8
-    font_weight = "normal" if n <= max_labels else "bold"
-    nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=font_size,
-                            font_weight=font_weight)
+    fig = go.Figure()
+    for trace in build_edge_traces(G, pos):
+        fig.add_trace(trace)
 
     if show_weights:
         if G.number_of_edges() > 200:
             print("Skipping --show-weights: too many edges to annotate legibly "
                   "(use a sparser graph - higher --threshold or lower --k).")
         else:
-            edge_labels = {e: f"{G.edges[e]['weight']:.2f}" for e in G.edges}
-            nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, ax=ax, font_size=6)
+            fig.add_trace(build_edge_hover_trace(G, pos))
 
-    ax.axis("off")
+    for trace in build_node_traces(G, communities, pos, color_by, max_labels):
+        fig.add_trace(trace)
+
+    if cluster_circles:
+        add_cluster_circles(fig, G, pos, communities, min_circle_size)
 
     if color_by == "community":
-        ax.set_title(f"Document similarity graph\n"
-                     f"(node size = prior knowledge, color = detected community, "
-                     f"{len(communities)} found)")
+        title = (f"Document similarity graph - {n} documents, "
+                 f"color = detected community ({len(communities)} found)")
     else:
-        ax.set_title("Document similarity graph\n(node size = prior knowledge, color = difficulty)")
-        diff_handles = [
-            plt.Line2D([0], [0], marker="o", color="w", label=d,
-                       markerfacecolor=_DIFFICULTY_COLORS[d], markersize=10)
-            for d in DIFFICULTY_ORDER if d in _DIFFICULTY_COLORS
-        ]
-        ax.legend(handles=diff_handles, title="Difficulty", loc="upper left",
-                  fontsize=8, framealpha=0.9)
+        title = f"Document similarity graph - {n} documents, color = difficulty"
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16)),
+        xaxis=dict(visible=False, showgrid=False, zeroline=False),
+        yaxis=dict(visible=False, showgrid=False, zeroline=False,
+                   scaleanchor="x", scaleratio=1),  # keep circles circular
+        plot_bgcolor="white",
+        hovermode="closest",
+        legend=dict(title=("Community (primary category)" if color_by == "community" else "Difficulty"),
+                    itemsizing="constant"),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=850,
+    )
+    return fig
 
 
 def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
                             layout="forceatlas2", color_by="auto", max_labels=40,
-                            show_weights=False, cluster_circles=True, min_circle_size=3):
+                            show_weights=False, cluster_circles=True, min_circle_size=3,
+                            use_cdn=False):
     vocab = build_vocab(parsed)
     if not vocab:
         raise SystemExit("No category names found in the input - can't compute similarity.")
@@ -380,16 +480,12 @@ def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
               f"- consider raising --threshold, or switch to --method knn, for a "
               f"clearer picture.")
 
-    fig_size = 12 if G.number_of_nodes() <= max_labels else 16
-    fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.85))
-    plot_graph(G, ax, layout=layout, color_by=color_by, max_labels=max_labels,
-              show_weights=show_weights, cluster_circles=cluster_circles,
-              min_circle_size=min_circle_size)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Saved similarity graph to {out_path}")
-    return G
+    fig = build_figure(G, layout=layout, color_by=color_by, max_labels=max_labels,
+                       show_weights=show_weights, cluster_circles=cluster_circles,
+                       min_circle_size=min_circle_size)
+    fig.write_html(out_path, include_plotlyjs=("cdn" if use_cdn else True))
+    print(f"Saved interactive similarity graph to {out_path}")
+    return G, fig
 
 
 # ---------------------------------------------------------------------------
@@ -397,9 +493,9 @@ def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize document closeness as an undirected graph")
+    parser = argparse.ArgumentParser(description="Visualize document closeness as an interactive undirected graph")
     parser.add_argument("json_path", help="Path to input JSON (array, single object, or JSON-lines)")
-    parser.add_argument("--out", default="similarity_graph.png", help="Output image path")
+    parser.add_argument("--out", default="similarity_graph.html", help="Output HTML path")
     parser.add_argument("--method", choices=["threshold", "knn"], default="knn",
                         help="knn (default): connect each doc to its --k closest neighbors "
                              "- bounded edge count, safe for large datasets. "
@@ -421,12 +517,16 @@ def main():
                              "per detected community is labeled (plus its member count) "
                              "instead of every title")
     parser.add_argument("--show-weights", action="store_true",
-                        help="Annotate edges with their similarity score (small graphs only)")
+                        help="Add hoverable points at edge midpoints showing similarity "
+                             "score (small/medium graphs only)")
     parser.add_argument("--no-cluster-circles", action="store_true",
                         help="Disable the dashed circles drawn around each detected "
                              "cluster (labeled with its primary category)")
     parser.add_argument("--min-circle-size", type=int, default=3,
                         help="Minimum cluster size to draw a circle around (default 3)")
+    parser.add_argument("--cdn", action="store_true",
+                        help="Load plotly.js from a CDN instead of embedding it - much "
+                             "smaller HTML file, but needs an internet connection to view")
     args = parser.parse_args()
 
     records = load_records(args.json_path)
@@ -439,7 +539,7 @@ def main():
         parsed, args.out, method=args.method, threshold=args.threshold, k=args.k,
         layout=args.layout, color_by=args.color_by, max_labels=args.max_labels,
         show_weights=args.show_weights, cluster_circles=not args.no_cluster_circles,
-        min_circle_size=args.min_circle_size,
+        min_circle_size=args.min_circle_size, use_cdn=args.cdn,
     )
 
 
