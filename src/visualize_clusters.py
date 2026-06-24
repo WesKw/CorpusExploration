@@ -145,7 +145,7 @@ def parse_records(records):
             "difficulty": (r.get("difficulty") or "unknown").lower(),
             "prior_knowledge": parse_probability(r.get("prior_knowledge")),
             "tokens": parse_int(r.get("tokens")),
-            "location": r.get("location", "")
+            "location": r.get("location", "None")
         }
 
         categories = {}
@@ -362,7 +362,7 @@ def plot_difficulty_by_category(parsed, ax, top_n=10):
               bbox_to_anchor=(0, -0.32), ncol=4, framealpha=0.9)
 
 
-def plot_summary_text(parsed, ax):
+def plot_summary_text(parsed, ax, fig):
     ax.axis("off")
     n = len(parsed)
     avg_pk = np.mean([p["prior_knowledge"] for p in parsed if p["prior_knowledge"] is not None])
@@ -374,8 +374,9 @@ def plot_summary_text(parsed, ax):
         f"Avg. prior knowledge: {avg_pk:.2f}" if not np.isnan(avg_pk) else "Avg. prior knowledge: n/a",
         f"Avg. tokens: {avg_tokens:.0f}" if not np.isnan(avg_tokens) else "Avg. tokens: n/a",
     ]
-    ax.text(0.05, 0.8, "\n".join(lines), fontsize=12, va="top",
-            family="monospace", transform=ax.transAxes)
+    # ax.text(0.05, 0.8, "\n".join(lines), fontsize=12, va="top",
+            # family="monospace", transform=ax.transAxes)
+    fig.supxlabel(' | '.join(lines))
     ax.set_title("Summary")
 
 
@@ -392,7 +393,7 @@ def build_dashboard(parsed, out_path):
     plot_tokens_by_category(parsed, axes[0, 3])
     plot_prior_knowledge_vs_difficulty(parsed, axes[1, 0])
     plot_category_probability_box(parsed, axes[1, 1])
-    plot_summary_text(parsed, axes[1, 2])
+    plot_summary_text(parsed, axes[1, 2], fig)
     plot_difficulty_by_category(parsed, axes[1, 3])
 
     fig.suptitle("Document Cluster Overview", fontsize=16, fontweight="bold")

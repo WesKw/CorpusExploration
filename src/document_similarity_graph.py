@@ -147,6 +147,7 @@ def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
             confidence=p["confidence"],
             prior_knowledge=p["prior_knowledge"],
             tokens=p.get("tokens"),
+            location=p.get("location"),
             categories=p["categories"],
         )
 
@@ -275,7 +276,8 @@ def node_hover_text(G, node):
         f"Difficulty: {G.nodes[node]['difficulty']}<br>"
         f"Confidence: {G.nodes[node]['confidence']}<br>"
         f"Prior knowledge: {pk_str}<br>"
-        f"Tokens: {tokens_str}"
+        f"Tokens: {tokens_str}<br>"
+        f"Corpus: {G.nodes[node]['location']}"
     )
 
 
