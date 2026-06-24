@@ -1,30 +1,45 @@
 #!/bin/bash -l
 #PBS -l select=1:system=crux
 #PBS -l place=scatter
-#PBS -l walltime=3:00:00
+#PBS -l walltime=5:00:00
 #PBS -l filesystems=home:eagle
 #PBS -q workq-route
 #PBS -A datascience_collab
 
+#["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"]
+
 export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/"
 model="google/gemma-4-31B-it"
 # model="openai/gpt-oss-120b"
-subset=starcoder
-sampleprob=0.025
-sample=1000
-temp=0.2
-threads=8
+sampleprob=0.01
+temp=0.1
+threads=3
+max_jsons=1
+max_doc_length=1000
+outfile="out$PBS_JOBID.txt"
+sample_prob_json="./sample_rates.json"
 
 . ~/.corpius/bin/activate
 cd /home/wkwiecinski/CorpusExploration/src
-# python exploration.py $OLMIX --threads 4 --subset $subset --sample-prob $sampleprob --model $model
-python exploration.py $OLMIX --threads $threads --sample $sample --model $model --temperature $temp --subset $subset > cluster.log
-python visualize_clusters.py output.txt
-python document_similarity_graph.py output.txt --method "knn" --k "15"
 
-save_dir="$model-clustering-$sample-$sampleprob-$temp-$subset"
+# save_dir="$model-clustering-$sample-$sampleprob-$temp-maxjsons$max_jsons-maxlength$max_doc_length"
+save_dir="$model-clustering-$PBS_JOBID"
 mkdir -p $save_dir
-mv cluster_dashboard.png $save_dir
-mv similarity_graph.png $save_dir
-mv output.txt $save_dir
-mv cluster.log $save_dir
+out="$save_dir/$outfile"
+
+cp $sample_prob_json $save_dir
+
+# python exploration.py $OLMIX --threads 4 --subset $subset --sample-prob $sampleprob --model $model
+python exploration.py \
+    $OLMIX --threads $threads --sample-prob $sampleprob --model $model --temperature $temp \
+    --max-json-amt $max_jsons --max-doc-length $max_doc_length --outfile $out \
+    --subset algebraic-stack --subset arxiv --subset dclm --subset open-web-math --subset starcoder \
+    --subset wiki --subset-sample-prob $sample_prob_json > "$save_dir/cluster.log"
+
+python visualize_clusters.py $out --out "cluster_dashboard_$PBS_JOBID.png"
+python document_similarity_graph.py $out --method "knn" --k "15" --out "similarity_graph_$PBS_JOBID.html"
+
+mv "cluster_dashboard_$PBS_JOBID.png" $save_dir
+mv "similarity_graph_$PBS_JOBID.html" $save_dir
+# mv output.txt $save_dir
+# mv cluster.log $save_dir
