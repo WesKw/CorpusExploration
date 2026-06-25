@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -l select=1:system=crux
 #PBS -l place=scatter
-#PBS -l walltime=5:00:00
+#PBS -l walltime=8:00:00
 #PBS -l filesystems=home:eagle
 #PBS -q workq-route
 #PBS -A datascience_collab
@@ -12,10 +12,10 @@ export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/"
 model="google/gemma-4-31B-it"
 # model="openai/gpt-oss-120b"
 sampleprob=0.01
-temp=0.1
+temp=0
 threads=3
-max_jsons=1
-max_doc_length=1000
+max_jsons=8
+max_doc_length=1250
 outfile="out$PBS_JOBID.txt"
 sample_prob_json="./sample_rates.json"
 
