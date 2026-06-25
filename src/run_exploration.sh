@@ -1,20 +1,20 @@
 #!/bin/bash -l
 #PBS -l select=1:system=crux
 #PBS -l place=scatter
-#PBS -l walltime=8:00:00
+#PBS -l walltime=10:00:00
 #PBS -l filesystems=home:eagle
 #PBS -q workq-route
 #PBS -A datascience_collab
 
-#["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"]
+#["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki", "pes2o"]
 
 export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/"
 model="google/gemma-4-31B-it"
 # model="openai/gpt-oss-120b"
 sampleprob=0.01
 temp=0
-threads=3
-max_jsons=8
+threads=5
+max_jsons=10
 max_doc_length=1250
 outfile="out$PBS_JOBID.txt"
 sample_prob_json="./sample_rates.json"
@@ -33,8 +33,7 @@ cp $sample_prob_json $save_dir
 python exploration.py \
     $OLMIX --threads $threads --sample-prob $sampleprob --model $model --temperature $temp \
     --max-json-amt $max_jsons --max-doc-length $max_doc_length --outfile $out \
-    --subset algebraic-stack --subset arxiv --subset dclm --subset open-web-math --subset starcoder \
-    --subset wiki --subset-sample-prob $sample_prob_json > "$save_dir/cluster.log"
+    --subset-sample-prob $sample_prob_json > "$save_dir/cluster.log"
 
 python visualize_clusters.py $out --out "cluster_dashboard_$PBS_JOBID.png"
 python document_similarity_graph.py $out --method "knn" --k "15" --out "similarity_graph_$PBS_JOBID.html"

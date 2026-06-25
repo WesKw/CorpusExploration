@@ -11,7 +11,10 @@ import zstandard as zstd
 import random
 import inference_auth_token
 import shutil
+import numpy as np
 
+from itertools import islice
+from mpi4py import MPI
 from collections import OrderedDict as od
 from argparse import ArgumentParser
 from pathlib import Path
@@ -24,6 +27,9 @@ UNIT_CHOICES = {
     "GB": math.pow(1024, 3),
     "TB": math.pow(1024, 4),
 }
+SUBSET_CHOICES=["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"]
+COMM = MPI.COMM_WORLD
+RANK = comm.Get_rank()
 
 # need a maximum length due to rate limiting
 # use global vars for some parameters, yes I know this is bad practice I'm doing this for convenience. Would be better
@@ -38,7 +44,7 @@ def process_json_file(args):
     path,sample_probability = args
     # print("Worker started")
     """Threads process a json"""
-    print(f"Processing {path}")
+    print(f"[{RANK}] Processing {path}")
     # print(path)
     # print(subset)
     
@@ -131,7 +137,7 @@ def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size:
     """
     # get authentication token
     # print("Documents:", jsons)
-    print(f"Clustering sample-size: {len(jsons)}")
+    print(f"[{RANK}] Starting LLM Inference ({len(jsons)})")
     token = inference_auth_token.get_access_token()
 
     client = openai.OpenAI(
@@ -151,7 +157,7 @@ def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size:
     all_results = []
     all_results_count = 0
 
-    out = open(OUTFILE_NAME, 'a')
+    out = open(f'rank{RANK}_{OUTFILE_NAME}, 'a')
 
     random.shuffle(jsons) # shuffle jsons to ensure we're not processing 1 subset at a time
     for i in range(0, len(jsons), batch_size):
@@ -214,15 +220,10 @@ def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size:
     return all_results
 
 
-def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, cluster_method: str, model: str, categories: list, sample: int, sample_probability: float|None, temperature: float, maximum_json_amt: int):
+def run_corpus_analysis(paths: list, nprocs: int, cluster_method: str, model: str, categories: list, sample: int, sample_probability: float|None, temperature: float, maximum_json_amt: int):
     """
     Path is the root directory of the training data
     """
-    paths = get_json_paths(root, subset, maximum_json_amt)
-    random.shuffle(paths) # shuffle the array to attempt to get an even distribution of work for threads
-    # paths = paths
-    # paths = [path for path in paths if subset != None and subset in path]
-
     dataset_size = 0
     skipped_file_names = set()
     collection_sizes = {}
@@ -251,7 +252,7 @@ def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, clust
             for doc in jsons:
                 doc["collection"] = collection
 
-            print(f"\033[K{file}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
+            # print(f"\033[K{file}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
 
             all_jsons.extend(jsons)
 
@@ -273,12 +274,6 @@ def get_corpus_metadata(root: Path, units: str, subset: list, nprocs: int, clust
 
         print(f"Sample size: {len(all_jsons)}")
         results = cluster_with_llm(all_jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"], temperature=temperature)
-        # with open("output.txt", 'w') as out:
-        #    for result in results:
-        #         try:
-        #            out.write(json.dumps(result) + "\n")
-        #         except Exception as exc:
-        #            print(exc)
 
 
 def get_json_paths(root: Path, subsets: list, max_json_amount: int = 0):
@@ -319,11 +314,8 @@ def get_json_paths(root: Path, subsets: list, max_json_amount: int = 0):
 
 
 if __name__ == "__main__":
-    SUBSET_CHOICES=["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"]
-
     parser = ArgumentParser()
     parser.add_argument("data", help="Location")
-    parser.add_argument("--units", help="Unit for size output", choices=["MB", "GB", "TB"], default="GB")
     parser.add_argument("--subset", action="append", help="Data subset to process. If none are specified, all subsets are chosen.", choices=SUBSET_CHOICES, default=None)
     parser.add_argument("--threads", help="Number of processes", default=1)
     parser.add_argument("--cluster-method", help="The method of clustering to use.", choices=["llm", "transformer"], default="llm")
@@ -344,20 +336,27 @@ if __name__ == "__main__":
     if args.subset == None:
         subsets = SUBSET_CHOICES
 
-    print("Running exploration with:")
-    print(f"\tdata -> {args.data}")
-    print(f"\tsubset -> {subsets}")
-    print(f"\tnthreads -> {args.threads}")
-    print(f"\tcluster method -> {args.cluster_method}")
-    print(f"\tmodel -> {args.model}")
-    print(f"\tmodel temperature -> {args.temperature}")
-    print(f"\tsample -> {args.sample}")
-    print(f"\tsample probability -> {args.sample_prob}")
-    print(f"\tmaximum doc length -> {args.max_doc_length}")
-    print(f"\tmaximum json amount -> {args.max_json_amt}")
-    print(f"\toutput file -> {args.outfile}")
-    print(f"\tsample rate file -> {args.subset_sample_prob}")
-    print(f"\tsample rates:")
+    if rank == 0:
+        print("Running exploration with:")
+        print(f"\tdata -> {args.data}")
+        print(f"\tsubset -> {subsets}")
+        print(f"\tnthreads -> {args.threads}")
+        print(f"\tcluster method -> {args.cluster_method}")
+        print(f"\tmodel -> {args.model}")
+        print(f"\tmodel temperature -> {args.temperature}")
+        print(f"\tsample -> {args.sample}")
+        print(f"\tsample probability -> {args.sample_prob}")
+        print(f"\tmaximum doc length -> {args.max_doc_length}")
+        print(f"\tmaximum json amount -> {args.max_json_amt}")
+        print(f"\toutput file -> {args.outfile}")
+        print(f"\tsample rate file -> {args.subset_sample_prob}")
+        print(f"\tsample rates:")
+        OUTFILE_NAME = args.outfile
+
+        # clear any existing json data before the job starts
+        if rank == 0:
+            if os.path.exists(OUTFILE_NAME):
+                os.remove(OUTFILE_NAME)
 
     probability = None
     if args.sample_prob != None:
@@ -365,11 +364,6 @@ if __name__ == "__main__":
         DEFAULT_SAMPLE_PROBABILITY = probability
 
     MAX_DOCUMENT_LENGTH = args.max_doc_length
-    OUTFILE_NAME = args.outfile
-
-    # clear any existing json data before the job starts
-    if os.path.exists(OUTFILE_NAME):
-        os.remove(OUTFILE_NAME)
 
     if args.subset_sample_prob:
         try:
@@ -380,17 +374,25 @@ if __name__ == "__main__":
         except:
             print(f"Could not locate sample file {args.subset_sample_prob}")
 
+    if rank == 0:
+        paths = get_json_paths(Path(args.data), subsets, args.max_json_amt)
+        random.shuffle(paths) # shuffle the array to attempt to get an even distribution of data for processes
+        chunked_paths = np.array_split(paths, comm.Get_size())
+        paths = []
+        for chunk in chunked_paths:
+            paths.append(chunk)
+    else: # other processes wait for jsons to process
+        paths = None
+
+    # print("rank ", rank)
+    paths = comm.scatter(paths, root=0)
+
     # get the corpus metadata
-    get_corpus_metadata(Path(args.data), args.units, subsets, int(args.threads), args.cluster_method, args.model, args.categories, int(args.sample), probability, args.temperature, args.max_json_amt)
+    run_corpus_analysis(paths, int(args.threads), args.cluster_method, args.model, args.categories, int(args.sample), probability, args.temperature, args.max_json_amt)
 
-    # visualize the data and save
-    # save_dir = f"./{'-'.join(args.model.split('/'))}-clustering-{'-'.join(args.subset)}-{args.sample}-temp{args.temperature:.01f}"
-    # subprocess.run(["python", "visualize_clusters.py", "output.txt"])
-    # subprocess.run(["python", "document_similarity_graph.py", "output.txt", '--method', 'knn', "--k", "10"])
-    # subprocess.run(["mkdir", "-p", f"{save_dir}"])
-    # subprocess.run(["mv", "cluster_dashboard.png", f"{save_dir}"])
-    # subprocess.run(["mv", "similarity_graph.png", f"{save_dir}"])
-    # subprocess.run(["mv", "output.txt", f"{save_dir}"])
-
-    # for file in ["cluster_dashboard.png", "similarity_graph.png", "output.txt"]:
-    #     shutil.move(file, f"./{'-'.join(args.model.split('/'))}-clustering-{'-'.join(args.subset)}-temp{args.temperature:.01f}/{file}")
+    # merge step (oh god I'm a physicist)
+    for i in range(COMM.Get_size()):
+        with open(OUTFILE, 'a') as combined:
+            with open(f"rank{i}_{OUTFILE}", 'r') as rank_file:
+                for line in rank_file.readlines():
+                    combined.write(line)
