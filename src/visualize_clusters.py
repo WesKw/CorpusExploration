@@ -154,7 +154,7 @@ def parse_records(records):
                 continue
             prob = parse_probability(value)
             if prob is not None:
-                categories[key] = prob
+                categories[key.lower()] = prob
 
         item["categories"] = dict(
             sorted(categories.items(), key=lambda kv: kv[1], reverse=True)

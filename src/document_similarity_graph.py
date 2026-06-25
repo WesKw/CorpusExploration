@@ -17,15 +17,23 @@ Looks good. Can you draw circles around the clusters and label them with the pri
 4) 
 Can you modify document_similarity_graph.py to use plotly instead of matplotlib for more interactibility?
 
+5)
+For document_similarity_graph.py, could you include the prior knowledge and content difficulty in the build_matrix function?
+
 document_similarity_graph.py
 
 Builds an interactive undirected graph showing how "close" documents are to
 one another, based on the categories (and probabilities) assigned to each
-document by the clustering pipeline. Categories are dynamic JSON keys (e.g.
-"machine_learning": "0.82") rather than fixed category1/2/3 fields, and a
-document can have any number of them. Two documents are considered close if
-they share categories with similar weight - this is measured with cosine
-similarity over a "category vector" for each document.
+document by the clustering pipeline, plus - optionally - how similar their
+difficulty level and prior-knowledge requirement are. Categories are dynamic
+JSON keys (e.g. "machine_learning": "0.82") rather than fixed category1/2/3
+fields, and a document can have any number of them. Closeness is measured
+with cosine similarity over a per-document vector: one dimension per
+category (the assigned probability), plus a difficulty dimension (ordinally
+encoded beginner..expert) and a prior_knowledge dimension, each scaled by a
+tunable weight so two documents on completely different topics but at the
+same difficulty/depth can register as weakly related, without that swamping
+genuine topical overlap.
 
 Renders with Plotly instead of matplotlib, so the output is a self-contained
 HTML file you can open in a browser: scroll to zoom, drag to pan, hover any
@@ -56,6 +64,7 @@ Usage:
     python document_similarity_graph.py records.json --min-circle-size 5
     python document_similarity_graph.py records.json --show-weights
     python document_similarity_graph.py records.json --cdn   # smaller file, needs internet to view
+    python document_similarity_graph.py records.json --difficulty-weight 0 --prior-knowledge-weight 0  # categories only, as before
 """
 
 import argparse
@@ -98,16 +107,59 @@ def build_vocab(parsed):
     return sorted(vocab)
 
 
-def build_matrix(parsed, vocab):
-    """Rows = documents, columns = categories, values = assigned probability
-    (0 if a document was not assigned that category)."""
+def difficulty_to_signed(difficulty):
+    """beginner -> -1.0, ..., expert -> +1.0, unknown/missing -> 0.0.
+
+    Centered rather than 0..1: with a plain 0..1 ordinal encoding, two
+    "beginner" docs (both 0) contribute nothing to the cosine dot product
+    on this dimension, while two "expert" docs (both 1) contribute the
+    most - an asymmetry with nothing to do with how similar the documents
+    actually are. Centering on 0 makes a match contribute the same amount
+    regardless of which end of the scale it's at, and makes "unknown"
+    truly neutral (0 contributes nothing when multiplied against anything)
+    instead of silently behaving like "beginner"."""
+    if difficulty in DIFFICULTY_ORDER:
+        return (DIFFICULTY_ORDER.index(difficulty) / (len(DIFFICULTY_ORDER) - 1)) * 2 - 1
+    return 0.0
+
+
+def prior_knowledge_to_signed(prior_knowledge):
+    """0.0 prior knowledge -> -1.0, 1.0 -> +1.0, missing -> 0.0 (neutral).
+    Same centering rationale as difficulty_to_signed."""
+    if prior_knowledge is None:
+        return 0.0
+    return (prior_knowledge - 0.5) * 2
+
+
+def build_matrix(parsed, vocab, difficulty_weight=0.5, prior_knowledge_weight=0.5):
+    """Rows = documents, columns = [one per category, then difficulty,
+    then prior_knowledge]. Category columns hold the assigned probability
+    (0 if a document wasn't assigned that category). The two metadata
+    columns are appended at the end, each centered to [-1, 1] (see
+    difficulty_to_signed/prior_knowledge_to_signed) and multiplied by its
+    `_weight`.
+
+    Category columns are sparse - most documents only populate 2-4 of them
+    out of possibly dozens - while difficulty/prior_knowledge are dense
+    (present on every document). Left at full scale, two dense columns
+    would dominate cosine similarity over many sparse ones; the weights
+    default to 0.5 so difficulty/depth nudges which documents look close
+    without overriding genuine topical overlap. Set a weight to 0 to drop
+    that signal entirely (matching the old categories-only behavior)."""
     index = {name: i for i, name in enumerate(vocab)}
-    matrix = np.zeros((len(parsed), len(vocab)))
+    n_cols = len(vocab) + 2
+    difficulty_col, prior_knowledge_col = len(vocab), len(vocab) + 1
+
+    matrix = np.zeros((len(parsed), n_cols))
     for row, p in enumerate(parsed):
         for name, prob in p["categories"].items():
             col = index.get(name)
             if col is not None:
                 matrix[row, col] = prob
+
+        matrix[row, difficulty_col] = difficulty_to_signed(p.get("difficulty")) * difficulty_weight
+        matrix[row, prior_knowledge_col] = prior_knowledge_to_signed(p.get("prior_knowledge")) * prior_knowledge_weight
+
     return matrix
 
 
@@ -147,7 +199,6 @@ def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
             confidence=p["confidence"],
             prior_knowledge=p["prior_knowledge"],
             tokens=p.get("tokens"),
-            location=p.get("location"),
             categories=p["categories"],
         )
 
@@ -276,8 +327,7 @@ def node_hover_text(G, node):
         f"Difficulty: {G.nodes[node]['difficulty']}<br>"
         f"Confidence: {G.nodes[node]['confidence']}<br>"
         f"Prior knowledge: {pk_str}<br>"
-        f"Tokens: {tokens_str}<br>"
-        f"Corpus: {G.nodes[node]['location']}"
+        f"Tokens: {tokens_str}"
     )
 
 
@@ -463,12 +513,13 @@ def build_figure(G, layout="forceatlas2", color_by="auto", max_labels=40,
 def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
                             layout="forceatlas2", color_by="auto", max_labels=40,
                             show_weights=False, cluster_circles=True, min_circle_size=3,
-                            use_cdn=False):
+                            use_cdn=False, difficulty_weight=0.5, prior_knowledge_weight=0.5):
     vocab = build_vocab(parsed)
     if not vocab:
         raise SystemExit("No category names found in the input - can't compute similarity.")
 
-    matrix = build_matrix(parsed, vocab)
+    matrix = build_matrix(parsed, vocab, difficulty_weight=difficulty_weight,
+                          prior_knowledge_weight=prior_knowledge_weight)
     sim = cosine_similarity_matrix(matrix)
     G = build_graph(parsed, sim, method=method, threshold=threshold, k=k)
 
@@ -529,6 +580,15 @@ def main():
     parser.add_argument("--cdn", action="store_true",
                         help="Load plotly.js from a CDN instead of embedding it - much "
                              "smaller HTML file, but needs an internet connection to view")
+    parser.add_argument("--difficulty-weight", type=float, default=0.5,
+                        help="How much a shared difficulty level (beginner..expert) "
+                             "contributes to similarity, relative to category overlap. "
+                             "0 disables it entirely, matching the old categories-only "
+                             "behavior (default 0.5)")
+    parser.add_argument("--prior-knowledge-weight", type=float, default=0.5,
+                        help="How much similar prior-knowledge requirements contribute "
+                             "to similarity, relative to category overlap. 0 disables "
+                             "it entirely (default 0.5)")
     args = parser.parse_args()
 
     records = load_records(args.json_path)
@@ -542,6 +602,8 @@ def main():
         layout=args.layout, color_by=args.color_by, max_labels=args.max_labels,
         show_weights=args.show_weights, cluster_circles=not args.no_cluster_circles,
         min_circle_size=args.min_circle_size, use_cdn=args.cdn,
+        difficulty_weight=args.difficulty_weight,
+        prior_knowledge_weight=args.prior_knowledge_weight,
     )
 
 
