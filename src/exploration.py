@@ -129,7 +129,7 @@ def process_json_file(arg):
         # print_rank_log(collection)
         # print_rank_log(str(SAMPLE_RATES.get(collection.lower(), DEFAULT_SAMPLE_PROBABILITY)))
         # use probability to determine whether or not to sample document
-        if random.random() < SAMPLE_RATES.get(collection.lower(), DEFAULT_SAMPLE_PROBABILITY):
+        if collection and random.random() < SAMPLE_RATES.get(collection.lower(), DEFAULT_SAMPLE_PROBABILITY):
             # if we're using a probability then add it to the json list.
             # Note: We cannot skip the processing step because we need to process a json to find the next one.
             #       This does, however, save on memory overall
@@ -183,7 +183,7 @@ def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size:
         doc_texts = []
         for doc in batch:
             # documents don't have titles, though all the jsons have a Text attribute
-            doc_texts.append(f"[collection: {doc.get('collection', 'None')}, Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
+            doc_texts.append(f"collection: {doc.get('collection', 'None')}, Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
 
         response = client.chat.completions.create(
             model=model,
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     # parser.add_argument("--batch-rate")
     parser.add_argument("--outfile", default="output.txt")
     parser.add_argument("--subset-sample-prob", help="A json that includes the sample probability for each provided subset. Any rate not specified will default to --sample-prob", default=None)
-    parser.add_argument("--n-categories", help="The number of categories for the LLM to write for each document.", defualt=4, type=int)
+    parser.add_argument("--n-categories", help="The number of categories for the LLM to write for each document.", default=4, type=int)
 
     args = parser.parse_args()
 
@@ -401,7 +401,7 @@ if __name__ == "__main__":
         for chunk in chunked_paths:
             paths.append(chunk)
     else: # other processes wait for jsons to process
-        paths = None
+        paths = []
 
     # print("rank ", rank)
     paths = COMM.scatter(paths, root=0)
