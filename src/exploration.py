@@ -39,9 +39,9 @@ N_CATEGORIES=4
 MAX_DOCUMENT_LENGTH=5000
 DEFAULT_SAMPLE_PROBABILITY=1.0
 OUTFILE_NAME="output.txt"
-SAMPLE_RATES = {}
 OUTFILE_LOG=""
 OUTFILE="jsons_merged.txt"
+PER_FILE_SAMPLE_RATES={}
 
 
 def print_rank_log(msg):
@@ -51,12 +51,8 @@ def print_rank_log(msg):
 
 def process_json_file(arg):
     path = arg
-    # print("Worker started")
     """Threads process a json"""
-    # print(f"[{RANK}] Processing {path}")
     print_rank_log(f"[{RANK}] Processing {path}\n")
-    # print(path)
-    # print(subset)
     
     # get the collection that the file is a part of
     parts = Path(path).parts
@@ -74,13 +70,9 @@ def process_json_file(arg):
                 while chunk := f.read(chunk_size):
                     data.extend(chunk)
                     bytes += len(chunk)
-                    # print(f"\033[KSize: {bytes / (1024 * 1024 * 1024):.02f} GB", end="\r", flush=True)
-            # data = data.decode("utf-8")
-            # print(f"Processed {path}")
-            # bytes = int(result.stdout.decode("utf-8"))
         except Exception as exc:
-            print(f"Error occurred while processing {path}")
-            print(exc)
+            print_rank_log(f"Error occurred while processing {path}")
+            print_rank_log(exc)
             bytes = 0
 
     elif extension == ".zstd":
@@ -91,32 +83,26 @@ def process_json_file(arg):
                 with dctx.stream_reader(f) as reader:
                     while chunk := reader.read(chunk_size):
                         data.extend(chunk)
-                        bytes += len(chunk)
-                # print(f"Uncompressed size: {size} bytes")
-                # bytes = int(zstd_out.stderr.decode("utf-8").split(" ")[1])        
-            # data = data.decode("utf-8")
-            print(f"Processed {path}")
+                        bytes += len(chunk)     
+            print_rank_log(f"Processed {path}")
         except Exception as exc:
-            print(f"Error occurred while processing {path}")
-            print(exc)
+            print_rank_log(f"Error occurred while processing {path}")
+            print_rank_log(exc)
             bytes = 0
 
     else: # probably don't process the file if it's not compressed 
-        print(f"Skipped {path}")
+        print_rank_log(f"Skipped {path}")
         bytes=0
 
     documents = 0
-    # print(data)
     # Source - https://stackoverflow.com/a/54666028
     # Posted by pschill, modified by community. See post 'Timeline' for change history
     # Retrieved 2026-06-15, License - CC BY-SA 4.0
     
     # decode json data
     data = data.decode("utf-8")
-    # print("decoded")
     decoder = json.JSONDecoder()
     jsons = []
-    # jsons = json.loads(data)
     pos = 0 # use indexer so we don't have to slice the string
     while pos < len(data):
         value, end = decoder.raw_decode(data, pos)
@@ -125,28 +111,14 @@ def process_json_file(arg):
         while pos < len(data) and data[pos] in ' \t\n\r':
             pos += 1
 
-        # print_rank_log(str(SAMPLE_RATES))
-        # print_rank_log(collection)
-        # print_rank_log(str(SAMPLE_RATES.get(collection.lower(), DEFAULT_SAMPLE_PROBABILITY)))
         # use probability to determine whether or not to sample document
-        if collection and random.random() < SAMPLE_RATES.get(collection.lower(), DEFAULT_SAMPLE_PROBABILITY):
-            # if we're using a probability then add it to the json list.
-            # Note: We cannot skip the processing step because we need to process a json to find the next one.
-            #       This does, however, save on memory overall
+        if random.random() < PER_FILE_SAMPLE_RATES.get(path, DEFAULT_SAMPLE_PROBABILITY):
             jsons.append(value)
-        #     print_rank_log("Did save")
-        # else:
-        #     print_rank_log("Did not save")
         
     return (path, collection, bytes, len(jsons), jsons)
-    # print(f"\033[K{json}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
-
-    # # do some magic analysis here
-    # print(f"Removing {new_location.replace('.gz', '')}")
-    # os.remove(f"./{path.name.replace('.gz', '')}")
 
 
-def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size: int=10, delay: float=1.0, temperature: float=0.2):
+def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size: int=10, delay: float=1.0, temperature: float=0, backoff_mult=2, max_delay=10):
     """
     Use predefined labels to cluster documents according to labels. Otherwise
     the LLM will cluster based on similarity
@@ -205,12 +177,6 @@ def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size:
             batch_content = response.choices[0].message.content
             batch_content = batch_content.replace("```json", "").replace("```", "")
             batch_results = json.loads(batch_content)
-            # ordered dict retains order
-            # add word counts for each document into the json
-            # for idx,data in enumerate(batch):
-            #     print(data["text"])
-            #     ws_tokens_in_doc = len(data["text"].split())
-            #     list(batch_results.items())[idx]["word_count"] = ws_tokens_in_doc
 
             # all_results.extend(batch_results)
             all_results_count += len(batch_results)
@@ -229,14 +195,14 @@ def cluster_with_llm(jsons: list, model: str, categories: list[str], batch_size:
         print_rank_log(f"Processed batch {i // batch_size + 1} "
             f"({all_results_count}/{len(jsons)} docs)")
         
-        time.sleep(delay)  # Rate limiting
+        time.sleep(delay + random.uniform(0, 2))  # Rate limiting
         
     out.close()
 
     return all_results
 
 
-def run_corpus_analysis(paths: list, nprocs: int, cluster_method: str, model: str, categories: list, sample: int, sample_probability: float|None, temperature: float, maximum_json_amt: int):
+def run_corpus_analysis(paths: list, nprocs: int, cluster_method: str, model: str, categories: list, sample_probability: float|None, temperature: float, maximum_json_amt: int):
     """
     Path is the root directory of the training data
     """
@@ -265,8 +231,6 @@ def run_corpus_analysis(paths: list, nprocs: int, cluster_method: str, model: st
             for doc in jsons:
                 doc["collection"] = collection
 
-            # print(f"\033[K{file}\nTotal Size: {(dataset_size / UNIT_CHOICES[units]):.02f} {units}", end="\r", flush=True)
-
             all_jsons.extend(jsons)
 
     sys.stdout.flush()
@@ -281,10 +245,6 @@ def run_corpus_analysis(paths: list, nprocs: int, cluster_method: str, model: st
     # json_sample = random.sample(jsons, sample)
     # now that we have a small subset of jsons we do the analysis with an LLM to start
     if cluster_method == "llm":
-        # if we don't sample during processing... sample a subset afterwards.
-        if sample_probability == None:
-            all_jsons = random.sample(all_jsons, sample)
-
         # print_rank_log(f"Sample size: {len(all_jsons)}")
         results = cluster_with_llm(all_jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"], temperature=temperature)
 
@@ -333,7 +293,6 @@ if __name__ == "__main__":
     parser.add_argument("--threads", help="Number of processes", default=1)
     parser.add_argument("--cluster-method", help="The method of clustering to use.", choices=["llm", "transformer"], default="llm")
     parser.add_argument("--model", help="Available model to use", choices=AVAILABLE_MODELS, default="openai/gpt-oss-120b")
-    parser.add_argument("--sample", help="The number of documents to sample.", default="100")
     parser.add_argument("--categories", action="append", help="Classification categories.", default=["Beginner", "Intermediate", "Advanced", "Expert"])
     parser.add_argument("--sample-prob", help="The probability of retaining a processed json. [0, 1]. If set, overrides the --sample argument.", default=None)
     parser.add_argument("--temperature", help="LLM temperature", default=0.2)
@@ -341,7 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-json-amt", help="The maximum number of json files to process from each subset of data. If 0, all jsons found are processed.", default=0, type=int)
     # parser.add_argument("--batch-rate")
     parser.add_argument("--outfile", default="output.txt")
-    parser.add_argument("--subset-sample-prob", help="A json that includes the sample probability for each provided subset. Any rate not specified will default to --sample-prob", default=None)
+    parser.add_argument("--subset-sample-prob", help="A json that includes the sample probability for each file in the dataset. Any rate not specified will default to --sample-prob", default=None)
     parser.add_argument("--n-categories", help="The number of categories for the LLM to write for each document.", default=4, type=int)
 
     args = parser.parse_args()
@@ -360,6 +319,13 @@ if __name__ == "__main__":
     if os.path.exists(OUTFILE_LOG):
         os.remove(OUTFILE_LOG)
 
+    if args.subset_sample_prob:
+        try:
+            with open(args.subset_sample_prob) as sample_file:
+                PER_FILE_SAMPLE_RATES = json.load(sample_file)
+        except:
+            print_rank_log(f"Could not locate sample file {args.subset_sample_prob}")
+
     if RANK == 0:
         print_rank_log("Running exploration with:")
         print_rank_log(f"\tdata -> {args.data}")
@@ -368,30 +334,21 @@ if __name__ == "__main__":
         print_rank_log(f"\tcluster method -> {args.cluster_method}")
         print_rank_log(f"\tmodel -> {args.model}")
         print_rank_log(f"\tmodel temperature -> {args.temperature}")
-        print_rank_log(f"\tsample -> {args.sample}")
-        print_rank_log(f"\tsample probability -> {args.sample_prob}")
         print_rank_log(f"\tmaximum doc length -> {args.max_doc_length}")
         print_rank_log(f"\tmaximum json amount -> {args.max_json_amt}")
         print_rank_log(f"\toutput file -> {args.outfile}")
+        print_rank_log(f"\tdefault sample probability -> {args.sample_prob}")
         print_rank_log(f"\tsample rate file -> {args.subset_sample_prob}")
         print_rank_log(f"\tsample rates:")
+        for collection,rate in PER_FILE_SAMPLE_RATES.items():
+            print_rank_log(f"\t\t{collection} -> {rate}")
     
-
     probability = None
     if args.sample_prob != None:
         probability = float(args.sample_prob)
         DEFAULT_SAMPLE_PROBABILITY = probability
 
     MAX_DOCUMENT_LENGTH = args.max_doc_length
-
-    if args.subset_sample_prob:
-        try:
-            with open(args.subset_sample_prob) as sample_file:
-                SAMPLE_RATES = json.load(sample_file)
-                for collection,rate in SAMPLE_RATES.items():
-                    print_rank_log(f"\t\t{collection} -> {rate}")
-        except:
-            print_rank_log(f"Could not locate sample file {args.subset_sample_prob}")
 
     if RANK == 0:
         paths = get_json_paths(Path(args.data), subsets, args.max_json_amt)
@@ -407,11 +364,11 @@ if __name__ == "__main__":
     paths = COMM.scatter(paths, root=0)
 
     # get the corpus metadata
-    run_corpus_analysis(paths, int(args.threads), args.cluster_method, args.model, args.categories, int(args.sample), probability, args.temperature, args.max_json_amt)
+    run_corpus_analysis(paths, int(args.threads), args.cluster_method, args.model, args.categories, probability, args.temperature, args.max_json_amt)
 
     # merge step (oh god I'm a physicist)
-    for i in range(COMM.Get_size()):
-        with open(OUTFILE, 'a') as combined:
-            with open(OUTFILE_NAME, 'r') as rank_file:
-                for line in rank_file.readlines():
-                    combined.write(line)
+    # for i in range(COMM.Get_size()):
+        # with open(OUTFILE, 'a') as combined:
+            # with open(OUTFILE_NAME, 'r') as rank_file:
+                # for line in rank_file.readlines():
+                    # combined.write(line)
