@@ -6,16 +6,14 @@
 #PBS -q preemptable
 #PBS -A datascience_collab
 
-#["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki", "pes2o"]
-
-export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/"
+export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/wiki/"
 model="google/gemma-4-31B-it"
 # model="openai/gpt-oss-120b"
 sampleprob=0.01
 temp=0
 threads=4
-max_jsons=10
-max_doc_length=1250
+max_jsons=1
+max_doc_length=2000
 outfile="out$PBS_JOBID.txt"
 sample_prob_json="./sample_rates.json"
 
@@ -34,9 +32,9 @@ cp $sample_prob_json $save_dir
 
 # python exploration.py $OLMIX --threads 4 --subset $subset --sample-prob $sampleprob --model $model
 mpiexec -n 1 python exploration.py \
-    $OLMIX --threads $threads --sample-prob $sampleprob --model $model --temperature $temp \
-    --max-json-amt $max_jsons --max-doc-length $max_doc_length --outfile $out \
-    --subset-sample-prob $sample_prob_json
+    --data $OLMIX --threads $threads --sample_prob $sampleprob --model $model \
+    --max_json_amt $max_jsons --max_doc_length $max_doc_length --outfile $out \
+    --subset_sample_prob_file $sample_prob_json --subset wiki
 
 #python merge_step.py "$save_dir/*_rank?.txt" --outfile "$out"
 #python visualize_clusters.py "$out" --out "cluster_dashboard_$PBS_JOBID.png"
