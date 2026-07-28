@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
+from typing import Literal
 
 SUBSET_CHOICES=["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"]
 INFERENCE_CLUSTER=["sophia", "metis"]
@@ -43,7 +44,28 @@ class ExplorationArgs:
     cluster_sample_rate_json: str="cluster-sample-rate.json" # sample rate for cluster labels (experimental)
     write_batches_to_file: bool=True # write the classified data to a file.
 
-
     # misc args
     outfile:str="output.txt"
 
+@dataclass
+class ClusterArgs:
+    # input args
+    llm_data_regex: str
+    shard_data_regex: str
+    sort:bool=False # Sort the input files before processing.
+
+    # cluster args
+    method: Literal["none", "difficulty"] = "none" # The ordering method to use. None -> merges json files as is | difficulty -> Order by document difficulty. | topic -> Order by topic. 
+    reverse: bool=False # Reverse the ordering before writing.
+    n_clusters: int=4 # number of clusters to create.
+    seed:int=42 # The seed for k means.
+    batch_size:int=5000 # batch size for k means.
+    weights_json: str="difficulty-bias.json" # the biases for each text attribute in the json. Non-topic weights are 0.5 by default.
+    max_kmeans_points: int=-1 # the maximum number of points for updating clusters. Once this limit is reached, centroids become static and new points are fit to the existing centroids. -1 -> all points are used in clustering.
+    # cluster_sample_rate_json: str="cluster-sample-rate.json" # sample rate for cluster labels (experimental)
+    write_batches_to_file: bool=True # write the classified data to a file.
+
+    # meta args
+    outfile:str="output.json" # The final, merged json file name.
+
+    # parser.add_argument("--ordering-method", help="The method to use when ordering clustered data.", choices=["none", "difficulty"])

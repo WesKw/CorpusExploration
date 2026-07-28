@@ -38,6 +38,8 @@ mpiexec -n 10 python exploration.py \
     --max_json_amt $max_jsons --max_doc_length $max_doc_length --outfile $out \
     --subset_sample_prob_file $sample_prob_json --cluster $cluster
 
+orderings=()
+dataset_dir="$save_dir/"
 # python ordering_step.py "$save_dir/*_rank?.txt" --outfile "$out"
 # python visualize_clusters.py "$out" --out "cluster_dashboard_$PBS_JOBID.png"
 # python document_similarity_graph.py $out --method "knn" --k "15" --out "similarity_graph_$PBS_JOBID.html"

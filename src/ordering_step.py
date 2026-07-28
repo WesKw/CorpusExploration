@@ -4,13 +4,23 @@ import gzip
 import shutil
 import os
 import orjson
+import linecache
 
+from itertools import batched
 from argparse import ArgumentParser
 from pathlib import Path
 from glob import glob
+from ExplorationArgs import ClusterArgs
+from simple_parsing import parse
+from sklearn.cluster import MiniBatchKMeans
 
 
-def IGNORE={"text"}
+# Every other key on a record is treated as "<category_name>": "<probability>"
+RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens", "vocab_complexity", "sentence_quality", "batch_id", "row_index", "pid", "rank"}
+_RESERVED_KEYS_NORM = {k.lower().replace(" ", "_").replace("-", "_")
+                       for k in RESERVED_KEYS}
+CONFIDENCE_ORDER = ["low", "medium", "high"]
+DIFFICULTY_ORDER = ["beginner", "intermediate", "advanced", "expert"]
 
 
 def _cluster_step(kmeans, batch: list, random_seed: int):
@@ -39,7 +49,7 @@ def _cluster_step(kmeans, batch: list, random_seed: int):
             return int(float(value))
         except (TypeError, ValueError):
             return None
-        
+
     def difficulty_to_signed(difficulty):
         """beginner -> -1.0, ..., expert -> +1.0, unknown/missing -> 0.0.
 
@@ -55,32 +65,58 @@ def _cluster_step(kmeans, batch: list, random_seed: int):
             return (DIFFICULTY_ORDER.index(difficulty) / (len(DIFFICULTY_ORDER) - 1)) * 2 - 1
         return 0.0
 
-
     def prior_knowledge_to_signed(prior_knowledge):
         """0.0 prior knowledge -> -1.0, 1.0 -> +1.0, missing -> 0.0 (neutral).
         Same centering rationale as difficulty_to_signed."""
         if prior_knowledge is None:
             return 0.0
         return (prior_knowledge - 0.5) * 2
-    
-    def build_matrix(parsed, vocab):
-        """Rows = documents, columns = [one per category, then difficulty,
-        then prior_knowledge]. Category columns hold the assigned probability
-        (0 if a document wasn't assigned that category). The two metadata
-        columns are appended at the end, each centered to [-1, 1] (see
-        difficulty_to_signed/prior_knowledge_to_signed) and multiplied by its
-        `_weight`.
 
-        Category columns are sparse - most documents only populate 2-4 of them
-        out of possibly dozens - while difficulty/prior_knowledge are dense
-        (present on every document). Left at full scale, two dense columns
-        would dominate cosine similarity over many sparse ones; the weights
-        default to 0.5 so difficulty/depth nudges which documents look close
-        without overriding genuine topical overlap. Set a weight to 0 to drop
-        that signal entirely (matching the old categories-only behavior)."""
+    def vocab_complexity_to_signed(vocab_complexity):
+        """Same centering rationale as difficulty/prior_knowledge. Uses
+        parse_probability so the string "None" (parse_records' default for
+        this field) is treated the same as an actual None, rather than
+        blowing up trying to subtract 0.5 from a string."""
+        value = parse_probability(vocab_complexity)
+        if value is None:
+            return 0.0
+        return (value - 0.5) * 2
+
+    def build_matrix(parsed, vocab):
+        """Returns (matrix, n_feature_cols).
+
+        Columns 0..n_feature_cols-1 are what KMeans actually sees: one per
+        category (sparse), then difficulty, prior_knowledge, vocab_complexity
+        (dense, each centered to [-1, 1] and weighted via CLUSTERING_WEIGHTS
+        - see difficulty_to_signed/prior_knowledge_to_signed/
+        vocab_complexity_to_signed for the centering rationale; weights
+        default to 0.5 so these dense signals nudge similarity without
+        drowning out sparse topical overlap. Set a weight to 0 to drop that
+        signal entirely).
+
+        Columns n_feature_cols.. onward (row_index, rank, pid) are pure
+        identifiers, stored raw and unweighted purely so records can be
+        matched back up later. They are NOT part of n_feature_cols and are
+        sliced off before anything is fit - they have zero effect on
+        clustering. Missing identifiers are stored as NaN rather than 0, so
+        a real id of 0 isn't confused with "absent".
+
+        NOTE: this assumes row_index/rank/pid are numeric. If pid is ever a
+        non-numeric string in your data, don't put it in this float array -
+        return it as a separate parallel list instead.
+        """
         index = {name: i for i, name in enumerate(vocab)}
-        n_cols = len(vocab) + 2
-        difficulty_col, prior_knowledge_col,vocab = len(vocab), len(vocab) + 1, len(vocab) + 2
+        n_vocab = len(vocab)
+
+        difficulty_col = n_vocab
+        prior_knowledge_col = n_vocab + 1
+        vocab_complexity_col = n_vocab + 2
+        n_feature_cols = n_vocab + 3
+
+        row_index_col = n_feature_cols
+        rank_col = n_feature_cols + 1
+        pid_col = n_feature_cols + 2
+        n_cols = n_feature_cols + 3
 
         matrix = np.zeros((len(parsed), n_cols))
         for row, p in enumerate(parsed):
@@ -89,13 +125,16 @@ def _cluster_step(kmeans, batch: list, random_seed: int):
                 if col is not None:
                     matrix[row, col] = prob * CLUSTERING_WEIGHTS.get("category", 1.0)
 
-            # check if we can actually do weights like this 
             matrix[row, difficulty_col] = difficulty_to_signed(p.get("difficulty")) * CLUSTERING_WEIGHTS.get("difficulty", 0.5)
             matrix[row, prior_knowledge_col] = prior_knowledge_to_signed(p.get("prior_knowledge")) * CLUSTERING_WEIGHTS.get("prior_knowledge", 0.5)
-            matrix[row, vocab] = prior_knowledge_to_signed(p.get("vocab_complexity", "None")) * CLUSTERING_WEIGHTS.get("vocab_complexity", 0.5) 
-            # matrix[row, doc_id] = p.get("id", "None")
-        return matrix
-    
+            matrix[row, vocab_complexity_col] = vocab_complexity_to_signed(p.get("vocab_complexity")) * CLUSTERING_WEIGHTS.get("vocab_complexity", 0.5)
+
+            matrix[row, row_index_col] = p["row"] if p["row"] is not None else np.nan
+            matrix[row, rank_col] = p["rank"] if p["rank"] is not None else np.nan
+            matrix[row, pid_col] = p["pid"] if p["pid"] is not None else np.nan
+
+        return matrix, n_feature_cols, difficulty_col
+
     def parse_records(records):
         """Turn raw JSON records into a flat list of dicts ready for plotting.
 
@@ -112,7 +151,10 @@ def _cluster_step(kmeans, batch: list, random_seed: int):
                 "tokens": parse_int(r.get("tokens")),
                 "location": r.get("location", "None"),
                 "id": r.get("batch_id", "None"),
-                "vocab_complexity": r.get("vocab_complexity", "None")
+                "vocab_complexity": r.get("vocab_complexity", "None"),
+                "rank": r.get("rank"),
+                "pid": r.get("pid"),
+                "row": r.get("row_index"),
             }
 
             categories = {}
@@ -129,29 +171,81 @@ def _cluster_step(kmeans, batch: list, random_seed: int):
             parsed.append(item)
         return parsed
 
-
     parsed_batch = parse_records(batch)
     vocab = build_vocab(parsed_batch)
-    matrix = build_matrix(parsed_batch, vocab)
-    # first len(vocab) items in weights are for categories.
-    # the rest of the array is specific 
-    # weights = ([CLUSTERING_WEIGHTS.get("category", 1.0)] * len(vocab)) + [
-    #     CLUSTERING_WEIGHTS.get("difficulty", 0.5),
-    #     CLUSTERING_WEIGHTS.get("prior_knowledge", 0.5),
-    #     CLUSTERING_WEIGHTS.get("vocab_complexity", 0.5)
+    matrix, n_feature_cols, difficulty_col = build_matrix(parsed_batch, vocab)
 
-    # ]
-    # weights = np.array(weights)
+    # Only the feature columns drive clustering - row_index/rank/pid ride
+    # along in `matrix` for later recovery but never reach the fit.
+    feature_matrix = matrix[:, :n_feature_cols]
 
-    return matrix,kmeans.partial_fit(matrix)
+    return matrix, kmeans.partial_fit(feature_matrix), n_feature_cols, difficulty_col
+
+
+def batch_data(data: list, size: int):
+    for i in range(0, len(data), size):
+        yield data[i:i+size]
 
 
 def cluster_step(args, json_paths) -> list:
+    def _order_by_difficulty(matrix, n_feature_cols, kmeans, column, reverse=False):
+        """
+        For each cluster, return the rows assigned to it (with identifiers),
+        sorted from closest to farthest from that cluster's centroid.
+
+        Returns: dict[int, list[dict]] mapping cluster_label -> ordered records,
+        each record carrying its distance plus the recoverable identifier columns.
+        """
+        feature_matrix = matrix[:, :n_feature_cols]
+        labels = kmeans.predict(feature_matrix)
+        # column is the overall difficulty column
+        centroids = clusters.cluster_centers_
+        order = np.argsort(centroids[:, column])
+        if reverse: # reverse is hardest to easiest
+            order = order[::-1]
+
+        n_feature_cols = feature_matrix.shape[1]
+        row_index_col = n_feature_cols
+        rank_col = n_feature_cols + 1
+        pid_col = n_feature_cols + 2
+
+        result = []
+        for cluster_id in order:
+            member_rows = np.where(labels == cluster_id)[0]
+            if len(member_rows) == 0:
+                result[cluster_id] = []
+                continue
+
+            centroid = centroids[cluster_id]
+            # Euclidean distance in feature space only - identifiers never
+            # factor into distance since they were sliced off before fit/predict.
+            distances = np.linalg.norm(feature_matrix[member_rows] - centroid, axis=1)
+
+            order = np.argsort(distances)  # ascending: closest first
+            ordered_rows = member_rows[order]
+            ordered_distances = distances[order]
+
+            records = []
+            for row, dist in zip(ordered_rows, ordered_distances):
+                records.append({
+                    "distance": float(dist),
+                    "row_index": None if np.isnan(matrix[row, row_index_col]) else int(matrix[row, row_index_col]),
+                    "rank": None if np.isnan(matrix[row, rank_col]) else int(matrix[row, rank_col]),
+                    "pid": None if np.isnan(matrix[row, pid_col]) else int(matrix[row, pid_col]),
+                })
+            results.extend(records)
+            # result[cluster_id] = records
+        return result
+
+    def _none():
+        return
+
     """Clusters all documents and saves them as a list."""
     json_files = ... 
 
     # if no ordering step was specifed just return an empty list.
     if args.ordering_method == "none":
+
         return []
 
     jsons = []
@@ -162,18 +256,29 @@ def cluster_step(args, json_paths) -> list:
         with open(file, 'r') as fin:
             for idx,line in enumerate(fin, start=1):
                 data = json.loads(line)
-                data.drop("text") # ignore any text (we don't need it, the processing is done in a previous step)
-                data["index"] = idx
-                data["file"] = file
                 jsons.append(data)
 
-
     # here, we do the actual clustering step
+    kmeans = MiniBatchKMeans(n_clusters=args.n_clusters, random_state=args.seed, batch_size=args.batch_size, n_init="auto")
+    n_features = 0
+    diff_col = 0
+    for batch in batch_data(jsons, args.batch_size)
+        matrix,kmeans_step,n_feature_cols,difficulty_col=_cluster_step(kmeans, batch, args.seed)
+        kmeans = kmeans_step
+        diff_col = difficulty_col
+        n_features = n_feature_cols
 
-    return data
+    data=[]
+    # then once we have clusters we need to order
+    if args.ordering_method == "difficulty":
+        data = _order_by_difficulty(matrix, n_features, kmeans, difficulty_col, args.reverse)
+    else:
+        raise Exception(f"Unsupported ordering: {args.ordering_method}")
+
+    return data # return final ordered data.
 
 
-def merge_step(ordered_data: list, outfile: str, json_paths: list):
+def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list, shard_data_paths: list):
     """Writes all data to a file given a specific order from the cluster step. Assumes ordered_data is a list of json dicts"""
     if os.path.exists(outfile):
         os.remove(outfile)
@@ -181,32 +286,41 @@ def merge_step(ordered_data: list, outfile: str, json_paths: list):
     # there was no clustering & ordering step, just combine json files in json_paths.
     if not ordered_data:
         with open(outfile, 'wb') as dst:
-            for file in json_paths:
+            for file in text_attribute_json_paths:
                 with open(file, 'rb') as src:
                     shutil.copyfileobj(src, dst)
 
-    # if we do have ordered data...
-    # then write it to a single json.
-    # todo:: This could definitely be a memory issue. We'll need to use a mapping so that we don't have to load all of the text
-    # into memory.
-    with open(outfile, 'wb') as combined:
-        combined.write(orjson.dumps(ordered_data))
+    jsons_location = str(Path(text_attribute_json_paths[0]).parents[0])
+    shards_location = str(Path(shard_data_paths[0]).parents[0])
+
+    with open(outfile, 'w') as out:
+        # if we do have ordered data... pull it from the specified json based on metadata then write to the final output file.
+        for obj in ordered_data:
+            rank = obj["rank"]
+            pid = obj["pid"]
+            idx = obj["row_index"]
+            line = linecache.getline(f"{shards_location}/merged.out_rank{rank}_dump.json_pid{pid}.json", idx)
+            out.write(line)
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("jsonregex", help="Regex of all jsons to merge.")
-    parser.add_argument("--outfile", help="The merged json file name.", default="output.json")
-    parser.add_argument("--ordering-method", help="The method to use when ordering clustered data.", choices=["none", "difficulty"])
-    parser.add_argument("--attribute-weights", help="The weights to use for each attribute in the data. If no weights are provided, any attribute that is not a 'topic' attribute is weighted with 0.5.", default="")
-    args = parser.parse_args()
+    args = parse(ClusterArgs)
 
-    json_paths = sorted(glob(args.jsonregex))
-    print(f"Found {len(json_paths)} paths to merge")
-    data = cluster_step(args, json_paths)
+    # gather json paths
+    text_attribute_json_paths = glob(args.llm_data_regex)
+    shard_data_paths = glob(args.shard_data_regex)
+    if args.sort:
+        text_attribute_json_paths = sorted(text_attribute_json_paths)
+        shard_data_paths = sorted(shared_data_paths)
 
+    # call cluster step
+    print(f"Found {len(text_attribute_json_paths)} paths to merge")
+    print(f"Found {len(shard_data_paths)} shards for merging")
+    data = cluster_step(args, text_attribute_json_paths)
+
+    # merge results
     outfile = args.outfile
     # merge step (oh god I'm a physicist)
-    merged_step(data, outfile, json_paths)
+    merged_step(data, outfile, text_attribute_json_paths, shared_data_paths)
 
     print(f"Saved to {outfile}")

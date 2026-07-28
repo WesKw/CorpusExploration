@@ -111,6 +111,7 @@ def process_json_file(arg):
     jsons = []
     pos = 0 # use indexer so we don't have to slice the string
     index = 1
+    pid = os.getpid()
     while pos < len(data):
         value, end = decoder.raw_decode(data, pos)
         # print(value)
@@ -121,11 +122,13 @@ def process_json_file(arg):
         # use probability to determine whether or not to sample document
         if random.random() < PER_FILE_SAMPLE_RATES.get(collection, DEFAULT_SAMPLE_PROBABILITY):
             # chunk the document (we're only submitting X tokens anyway, saves memory)
-            # dump json to some output file so that we still have the processed data, just not in memory.
-            with open(f'{OUTFILE_DUMP}', 'ab') as json_dump:
-                json_dump.write(orjson.dumps(value), option=orjson.OPT_APPEND_NEWLINE)
+            # dump json to some output file based on rank and pid so that we still have the processed data, just not in memory.
+            # this is important for keeping a mapping for ordering since we don't keep all of the text in each document
+            with open(f'{OUTFILE_DUMP}_pid{pid}.json', 'ab') as json_dump:
+                json_dump.write(orjson.dumps(value, option=orjson.OPT_APPEND_NEWLINE))
             value["text"] = value.get('text', '')[:MAX_DOCUMENT_LENGTH] # after we write to a file, then chop the text to save memory for processing
             value["rank"] = RANK
+            value["pid"] = pid
             value["row_index"] = index
             jsons.append(value)
             index += 1
@@ -156,7 +159,7 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
     
     # give concrete classifications for now
     # todo:: include the subsection of data that the document is from
-    prompt = f"""You are a document classifier. Cluster documents by topic with probabilities. Add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0.001 and 1, 0 is little domain knowledge and 1 is high domain knowledge. vocab_complexity is from 0.001 to 1, 0.001 is simple words and 1 is high amounts of technical jargon or rare words. sentence_quality is a number from 0.001 to 1, indicating how well formed the average sentence is in each document. Include the number of white space separated tokens in the document. Do not use any previous JSON formats. Respond ONLY with a JSON array: [{{"title": "<title>", {category_string}"difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "vocab_complexity": "<vocab_complexity>", "language": "<language>": "tokens": "<number_of_tokens>", "location": "<collection>", "sentence_quality": "<quality>"}}]"""
+    prompt = f"""You are a document classifier. Cluster documents by topic with probabilities. Add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0.001 and 1, 0 is little domain knowledge and 1 is high domain knowledge. vocab_complexity is from 0.001 to 1, 0.001 is simple words and 1 is high amounts of technical jargon or rare words. sentence_quality is a number from 0.001 to 1, indicating how well formed the average sentence is in each document. Include the number of white space separated tokens in the document. Do not use any previous JSON formats. Respond ONLY with a JSON array: [{{"title": "<title>", {category_string}"difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "vocab_complexity": "<vocab_complexity>", "language": "<language>": "tokens": "<number_of_tokens>", "location": "<collection>", "sentence_quality": "<quality>", "idx": "<row_index>", "rank": "<rank>", "pid": "<pid>"}}]"""
 
     total=0
     # random.shuffle(jsons) # shuffle jsons to ensure we're not processing 1 subset at a time
@@ -167,7 +170,7 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
         doc_texts = []
         for idx,doc in enumerate(batch):
             # documents don't have titles, though all the jsons have a Text attribute
-            doc_texts.append(f"collection: {doc.get('collection', 'None')}, batch_id: {idx}, Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
+            doc_texts.append(f"collection: {doc.get('collection', 'None')}, idx: {doc.get('row_index', '')}, rank: {doc.get('rank', '')}, pid: {doc.get('pid', '')}, Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
 
         retries=0
         mult=backoff_mult
@@ -187,8 +190,8 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
                     batch_content = response.choices[0].message.content
                     batch_content = batch_content.replace("```json", "").replace("```", "")
                     batch_results = json.loads(batch_content)
-                    for doc,result in zip(batch, batch_results):
-                        result["text"] = doc["text"] # I have not noticed that the results are out of order in any capacity.
+                    # for doc,result in zip(batch, batch_results):
+                    #     result["text"] = doc["text"] # I have not noticed that the results are out of order in any capacity.
 
                     total += len(batch_results)
                     # write as we receive new results
@@ -291,7 +294,7 @@ async def run_corpus_clustering_with_paths(paths: list, nprocs: int, inference_m
     idx = 0
     N_CLUSTERS = 4 # do difficulty clustering for now
     SEED = 42
-    # kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=SEED, batch_size=BATCH_SIZE, n_init="auto")    
+    # kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=SEED, batch_size=BATCH_SIZE, n_init="auto")
     # use generator to build clusters for each rank
     async for batch in results:
         # save batches to a file and do clustering in the separate merge step.
@@ -319,15 +322,10 @@ async def run_corpus_clustering_with_paths(paths: list, nprocs: int, inference_m
         # sorted_centroids = sorted(zip(kmeans.labels_, centroids)) # centroids should converge on average difficulty levels if we have a large enough sample size
         # CENTROID_LABELS=["easy", "intermediate", "hard", "expert"]
         # doc_dict = {label: pts for idx,label in enumerate(CENTROID_LABELS, sorted_centroids)}
-        
-        # write_current_batch_to_file = True
-        # if write_current_batch_to_file:
-        #     ...
 
 
-def run_corpus_clustering_with_strings():
-    ...
-
+# def run_corpus_clustering_with_strings():
+#     ...
 
 
 def get_json_paths(root: Path, subsets: list, max_json_amount):
