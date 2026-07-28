@@ -9,9 +9,10 @@ import zstandard as zstd
 import random
 import inference_auth_token
 import numpy as np
-import torch.distributed as dist
+import asyncio
+import orjson
 
-
+from typing import overload
 from simple_parsing import parse
 from ExplorationArgs import ExplorationArgs
 from itertools import islice
@@ -34,15 +35,21 @@ DEFAULT_SAMPLE_PROBABILITY=1.0
 OUTFILE_NAME="output.txt"
 OUTFILE_LOG=""
 OUTFILE="jsons_merged.txt"
+OUTFILE_DUMP=""
 PER_FILE_SAMPLE_RATES={}
 CLUSTERING_WEIGHTS={}
 MAX_DOCUMENT_LENGTH=5000
-BATCH_SIZE=100
+BATCH_SIZE=5
 CLUSTER_SIZE=500
+MAX_KMEANS_POINTS=10_000
+WRITE_BATCHES_TO_FILE=True
 
 CONFIDENCE_ORDER = ["low", "medium", "high"]
 DIFFICULTY_ORDER = ["beginner", "intermediate", "advanced", "expert"]
 RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens"}
+
+
+INFERENCE_LINK="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
 
 
 def print_rank_log(msg):
@@ -103,6 +110,7 @@ def process_json_file(arg):
     decoder = json.JSONDecoder()
     jsons = []
     pos = 0 # use indexer so we don't have to slice the string
+    index = 1
     while pos < len(data):
         value, end = decoder.raw_decode(data, pos)
         # print(value)
@@ -113,13 +121,19 @@ def process_json_file(arg):
         # use probability to determine whether or not to sample document
         if random.random() < PER_FILE_SAMPLE_RATES.get(collection, DEFAULT_SAMPLE_PROBABILITY):
             # chunk the document (we're only submitting X tokens anyway, saves memory)
-            value["text"] = value.get('text', '')[:MAX_DOCUMENT_LENGTH] 
+            # dump json to some output file so that we still have the processed data, just not in memory.
+            with open(f'{OUTFILE_DUMP}', 'ab') as json_dump:
+                json_dump.write(orjson.dumps(value), option=orjson.OPT_APPEND_NEWLINE)
+            value["text"] = value.get('text', '')[:MAX_DOCUMENT_LENGTH] # after we write to a file, then chop the text to save memory for processing
+            value["rank"] = RANK
+            value["row_index"] = index
             jsons.append(value)
-        
+            index += 1
+
+
     return (path, collection, bytes, len(jsons), jsons)
 
-
-def process_with_llm(jsons: list, model: str, categories: list[str], batch_size: int=BATCH_SIZE, delay: float=1.0, temperature: float=0, backoff_mult=1, max_delay=20.0, max_retries=5):
+async def process_with_llm(jsons: list, model: str, categories: list[str], batch_size: int=BATCH_SIZE, delay: float=1.0, temperature: float=0, backoff_mult=1, max_delay=20.0, max_retries=5):
     """
     Use predefined labels to cluster documents according to labels. Otherwise
     the LLM will cluster based on similarity
@@ -129,8 +143,8 @@ def process_with_llm(jsons: list, model: str, categories: list[str], batch_size:
     print_rank_log(f"[{RANK}] Starting LLM Inference ({len(jsons)})")
     token = inference_auth_token.get_access_token()
 
-    client = openai.OpenAI(
-        base_url="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1",
+    client = openai.AsyncOpenAI(
+        base_url=INFERENCE_LINK,
         api_key=token
     )
 
@@ -142,8 +156,9 @@ def process_with_llm(jsons: list, model: str, categories: list[str], batch_size:
     
     # give concrete classifications for now
     # todo:: include the subsection of data that the document is from
-    prompt = f"""You are a document classifier. Cluster documents by topic with probabilities. Add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0.001 and 1, 0 is little domain knowledge and 1 is high domain knowledge. vocab_complexity is from 0.001 to 1, 0.001 is simple words and 1 is high amounts of technical jargon or rare works. Include the number of white space separated tokens in the document. Do not use any previous JSON formats. Respond ONLY with a JSON array: [{{"title": "<title>", {category_string}"confidence": "<low|medium|high>", "difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "vocab_complexity": "<vocab_complexity>", "language": "<language>": "tokens": "<number_of_tokens>", "location": "<collection>", "batch_id": "<batch_id>"}}]"""
+    prompt = f"""You are a document classifier. Cluster documents by topic with probabilities. Add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0.001 and 1, 0 is little domain knowledge and 1 is high domain knowledge. vocab_complexity is from 0.001 to 1, 0.001 is simple words and 1 is high amounts of technical jargon or rare words. sentence_quality is a number from 0.001 to 1, indicating how well formed the average sentence is in each document. Include the number of white space separated tokens in the document. Do not use any previous JSON formats. Respond ONLY with a JSON array: [{{"title": "<title>", {category_string}"difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "vocab_complexity": "<vocab_complexity>", "language": "<language>": "tokens": "<number_of_tokens>", "location": "<collection>", "sentence_quality": "<quality>"}}]"""
 
+    total=0
     # random.shuffle(jsons) # shuffle jsons to ensure we're not processing 1 subset at a time
     for i in range(0, len(jsons), batch_size):
         batch = jsons[i:i + batch_size]
@@ -154,13 +169,12 @@ def process_with_llm(jsons: list, model: str, categories: list[str], batch_size:
             # documents don't have titles, though all the jsons have a Text attribute
             doc_texts.append(f"collection: {doc.get('collection', 'None')}, batch_id: {idx}, Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
 
-        total=0
         retries=0
         mult=backoff_mult
         timeout=delay
         while True:
             try:
-                response = client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=model,
                     temperature=temperature,
                     messages=[   
@@ -173,6 +187,8 @@ def process_with_llm(jsons: list, model: str, categories: list[str], batch_size:
                     batch_content = response.choices[0].message.content
                     batch_content = batch_content.replace("```json", "").replace("```", "")
                     batch_results = json.loads(batch_content)
+                    for doc,result in zip(batch, batch_results):
+                        result["text"] = doc["text"] # I have not noticed that the results are out of order in any capacity.
 
                     total += len(batch_results)
                     # write as we receive new results
@@ -182,12 +198,14 @@ def process_with_llm(jsons: list, model: str, categories: list[str], batch_size:
                 except Exception as exc:
                     # just ignore a bad batch of json responses
                     print_rank_log(f"{exc}")
+                    print_rank_log(f"{response.choices[0].message.content}")
 
                 timeout=delay
                 retries=0
                 break 
 
-            except: # client failed
+            except Exception as exc: # client failed
+                print_rank_log("Failure:", exc)
                 # try again with a delay
                 timeout = math.pow(timeout + random.uniform(0, 2), backoff_mult)
                 print_rank_log(f"Sleeping for {timeout}s")
@@ -246,193 +264,74 @@ def do_preprocessing(paths: list, nprocs: int, maximum_json_amt: int):
     return all_jsons
 
 
-def cluster_step(kmeans, batch: list, random_seed: int, save_batch_to_file:bool=True):
-    def build_vocab(parsed):
-        """Collect the set of all distinct category names across all documents."""
-        vocab = set()
-        for p in parsed:
-            vocab.update(p["categories"].keys())
-        return sorted(vocab)
-
-    def parse_probability(value):
-        """Coerce a probability field (often a string) into a float, or None."""
-        if value is None or value == "":
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    def parse_int(value):
-        """Coerce a count field (often a string, sometimes "1234.0") into an
-        int, or None."""
-        if value is None or value == "":
-            return None
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-        
-    def difficulty_to_signed(difficulty):
-        """beginner -> -1.0, ..., expert -> +1.0, unknown/missing -> 0.0.
-
-        Centered rather than 0..1: with a plain 0..1 ordinal encoding, two
-        "beginner" docs (both 0) contribute nothing to the cosine dot product
-        on this dimension, while two "expert" docs (both 1) contribute the
-        most - an asymmetry with nothing to do with how similar the documents
-        actually are. Centering on 0 makes a match contribute the same amount
-        regardless of which end of the scale it's at, and makes "unknown"
-        truly neutral (0 contributes nothing when multiplied against anything)
-        instead of silently behaving like "beginner"."""
-        if difficulty in DIFFICULTY_ORDER:
-            return (DIFFICULTY_ORDER.index(difficulty) / (len(DIFFICULTY_ORDER) - 1)) * 2 - 1
-        return 0.0
-
-
-    def prior_knowledge_to_signed(prior_knowledge):
-        """0.0 prior knowledge -> -1.0, 1.0 -> +1.0, missing -> 0.0 (neutral).
-        Same centering rationale as difficulty_to_signed."""
-        if prior_knowledge is None:
-            return 0.0
-        return (prior_knowledge - 0.5) * 2
-    
-    def build_matrix(parsed, vocab):
-        """Rows = documents, columns = [one per category, then difficulty,
-        then prior_knowledge]. Category columns hold the assigned probability
-        (0 if a document wasn't assigned that category). The two metadata
-        columns are appended at the end, each centered to [-1, 1] (see
-        difficulty_to_signed/prior_knowledge_to_signed) and multiplied by its
-        `_weight`.
-
-        Category columns are sparse - most documents only populate 2-4 of them
-        out of possibly dozens - while difficulty/prior_knowledge are dense
-        (present on every document). Left at full scale, two dense columns
-        would dominate cosine similarity over many sparse ones; the weights
-        default to 0.5 so difficulty/depth nudges which documents look close
-        without overriding genuine topical overlap. Set a weight to 0 to drop
-        that signal entirely (matching the old categories-only behavior)."""
-        index = {name: i for i, name in enumerate(vocab)}
-        n_cols = len(vocab) + 2
-        difficulty_col, prior_knowledge_col,vocab = len(vocab), len(vocab) + 1, len(vocab) + 2
-
-        matrix = np.zeros((len(parsed), n_cols))
-        for row, p in enumerate(parsed):
-            for name, prob in p["categories"].items():
-                col = index.get(name)
-                if col is not None:
-                    matrix[row, col] = prob * CLUSTERING_WEIGHTS.get("category", 1.0)
-
-            matrix[row, difficulty_col] = difficulty_to_signed(p.get("difficulty")) * CLUSTERING_WEIGHTS.get("difficulty", 0.5)
-            matrix[row, prior_knowledge_col] = prior_knowledge_to_signed(p.get("prior_knowledge")) * CLUSTERING_WEIGHTS.get("prior_knowledge", 0.5)
-            matrix[row, vocab] = prior_knowledge_to_signed(p.get("vocab_complexity", "None")) * CLUSTERING_WEIGHTS.get("vocab_complexity", 0.5) 
-            # matrix[row, doc_id] = p.get("id", "None")
-        return matrix
-    
-    def parse_records(records):
-        """Turn raw JSON records into a flat list of dicts ready for plotting.
-
-        Each result has a "categories" dict of {category_name: probability},
-        sorted from most to least probable, so "rank 0" is always the
-        document's primary category regardless of how many it has."""
-        parsed = []
-        for r in records:
-            item = {
-                "title": r.get("title", "Untitled"),
-                "confidence": (r.get("confidence") or "unknown").lower(),
-                "difficulty": (r.get("difficulty") or "unknown").lower(),
-                "prior_knowledge": parse_probability(r.get("prior_knowledge")),
-                "tokens": parse_int(r.get("tokens")),
-                "location": r.get("location", "None"),
-                "id": r.get("batch_id", "None"),
-                "vocab_complexity": r.get("vocab_complexity", "None")
-            }
-
-            categories = {}
-            for key, value in r.items():
-                if key in RESERVED_KEYS:
-                    continue
-                prob = parse_probability(value)
-                if prob is not None:
-                    categories[key.lower()] = prob
-
-            item["categories"] = dict(
-                sorted(categories.items(), key=lambda kv: kv[1], reverse=True)
-            )
-            parsed.append(item)
-        return parsed
-
-
-    parsed_batch = parse_records(batch)
-    vocab = build_vocab(parsed_batch)
-    matrix = build_matrix(parsed_batch, vocab)
-    # first len(vocab) items in weights are for categories.
-    # the rest of the array is specific 
-    weights = ([CLUSTERING_WEIGHTS.get("category", 1.0)] * len(vocab)) + [
-        CLUSTERING_WEIGHTS.get("difficulty", 0.5),
-        CLUSTERING_WEIGHTS.get("prior_knowledge", 0.5)
-    ]
-    weights = np.array(weights)
-    
-    if save_batch_to_file:
-        out = open(f'{OUTFILE_NAME}', 'a')
-        for doc in batch:
-            try:
-                out.write(json.dumps(doc) + "\n")
-            except Exception as exc:
-                print_rank_log(f"{exc}")
-        out.close()
-
-    return kmeans.partial_fit(matrix, sample_weight=weights)
-
-
-def run_corpus_clustering(paths: list, nprocs: int, inference_method: str, model: str, categories: list, temperature: float, maximum_json_amt: int, tokenized_input=None):
+async def run_corpus_clustering_with_paths(paths: list, nprocs: int, inference_method: str, model: str, categories: list, temperature: float, maximum_json_amt: int, tokenized_input=None):
     """
     Path is the root directory of the training data
     """
     all_jsons = []
-    if not tokenized_input:
-        all_jsons = do_preprocessing(paths, nprocs, maximum_json_amt)
-    else:
-        ... # do we need to do something with jsons here
+    # if not tokenized_input:
+    all_jsons = do_preprocessing(paths, nprocs, maximum_json_amt)
+    # else:
+        # ... # do we need to do something with jsons here
     
     results=None
     # now that we have a small subset of jsons we do the analysis with an LLM to start
     if inference_method == "llm":
         # get generator
         results = process_with_llm(all_jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"])
-
     else:
         raise NotImplementedError("Non-llm analysis methods not implemented.")
     
     # One process should send seed documents to all other processes
+    
+    # overall container
 
     # some options that may turn into cli args
     docs_for_clustering = CLUSTER_SIZE
     idx = 0
     N_CLUSTERS = 4 # do difficulty clustering for now
     SEED = 42
-    kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=SEED, batch_size=BATCH_SIZE, n_init="auto")    
+    # kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=SEED, batch_size=BATCH_SIZE, n_init="auto")    
     # use generator to build clusters for each rank
-    for batch in results:
+    async for batch in results:
+        # save batches to a file and do clustering in the separate merge step.
+        if WRITE_BATCHES_TO_FILE:
+            for result in batch:
+                out = open(f'{OUTFILE_NAME}', 'a')
+                try:
+                    out.write(json.dumps(result) + "\n")
+                except Exception as exc:
+                    print_rank_log(f"{exc}")
+                out.close()
+        
+        ...
+
         # update the clusters with the next batch of data
-        kmeans = cluster_step(kmeans, batch, 42)
+        # points,kmeans = cluster_step(kmeans, batch, 42)
 
-        # print centroids
-        print_rank_log("New cluster centers:")
-        print_rank_log(f"{kmeans.cluster_centers_}")
+        # # print centroids
+        # print_rank_log("New cluster centers:")
+        # print_rank_log(f"{kmeans.cluster_centers_}")
 
-        # get c 
-        # processed = idx * len(batch)
-        # if processed >= docs_for_clustering:
-        #     # compute the documents closest to each centroid
+        # # check centroid labels
+        # centroids = kmeans.cluster_centers_[:, -3:] # hardcode difficulty columns (for now)
+        # feature_sums = np.sum(centroids, axis=1) # sum the features of each column to determine an outer label
+        # sorted_centroids = sorted(zip(kmeans.labels_, centroids)) # centroids should converge on average difficulty levels if we have a large enough sample size
+        # CENTROID_LABELS=["easy", "intermediate", "hard", "expert"]
+        # doc_dict = {label: pts for idx,label in enumerate(CENTROID_LABELS, sorted_centroids)}
+        
+        # write_current_batch_to_file = True
+        # if write_current_batch_to_file:
         #     ...
 
-        #     processed = len(batch)
-        #     idx = 0
+
+def run_corpus_clustering_with_strings():
+    ...
 
 
 
-def get_json_paths(root: Path, subsets: list, max_json_amount: int = 0):
+def get_json_paths(root: Path, subsets: list, max_json_amount):
+    print_rank_log(f"{max_json_amount}")
     gz_str = str(root) + "/**/*.gz"
     gz_paths = glob(gz_str, recursive=True)
     zstd_str = str(root) + "/**/*.zstd"
@@ -450,10 +349,11 @@ def get_json_paths(root: Path, subsets: list, max_json_amount: int = 0):
 
     random.shuffle(paths) # shuffle document paths to ensure we're not taking the same set of documents every time.
     maximum_paths = []
-    if max_json_amount and max_json_amount > 0:
+    if max_json_amount > 0:
         document_numbers = {} # initialize the counts dict
         for path in paths:
             subset_first = path.replace(f"{root}/", "").split("/")[0]
+            # print_rank_log(subset_first)
             
             if subset_first not in document_numbers:
                 document_numbers[subset_first] = 0
@@ -474,8 +374,23 @@ if __name__ == "__main__":
 
     subsets = args.subset
     N_CATEGORIES = args.n_categories
-    OUTFILE_NAME = f"{args.outfile}_rank{RANK}.txt"
+    OUTFILE_NAME = f"{args.outfile}_rank{RANK}.json" # data for each json row
     OUTFILE_LOG = f"{Path(args.outfile).parents[0]}/rank{RANK}.log"
+    OUTFILE_DUMP = f"{args.outfile}_rank{RANK}_dump.json"
+
+    cluster = args.cluster
+    model = args.model
+    MAX_KMEANS_POINTS = args.max_kmeans_points
+
+    if cluster == "sophia":
+        INFERENCE_LINK="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1"
+    elif cluster == "metis":
+        INFERENCE_LINK="https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
+    else:
+        raise NotImplementedError("Only sophia and metis clusters supported")
+
+    if model not in args.MODELS[cluster]:
+        raise NotImplementedError(f"Available models on {cluster}: {args.MODELS[cluster]}")
 
     # clear any existing json data before the job starts
     if os.path.exists(OUTFILE_NAME):
@@ -483,6 +398,9 @@ if __name__ == "__main__":
 
     if os.path.exists(OUTFILE_LOG):
         os.remove(OUTFILE_LOG)
+
+    if os.path.exists(OUTFILE_DUMP):
+        os.remove(OUTFILE_DUMP)
 
     if args.subset_sample_prob_file:
         try:
@@ -501,6 +419,7 @@ if __name__ == "__main__":
         print_rank_log(f"\tsubset -> {subsets}")
         print_rank_log(f"\tnthreads -> {args.threads}")
         print_rank_log(f"\tcluster method -> {args.inference_method}")
+        print_rank_log(f"\tcluster -> {args.cluster}")
         print_rank_log(f"\tmodel -> {args.model}")
         print_rank_log(f"\tmodel temperature -> {args.temperature}")
         print_rank_log(f"\tmaximum doc length -> {args.max_doc_length}")
@@ -513,9 +432,11 @@ if __name__ == "__main__":
             print_rank_log(f"\t\t{collection} -> {rate}")
         print_rank_log(f"\tNumber of clusters -> {args.n_clusters}")
         print_rank_log(f"\tCategory weights for clustering -> {args.weights_json}")
+        print_rank_log(f"\tMaximum cluster points -> {args.max_kmeans_points}")
     
     DEFAULT_SAMPLE_PROBABILITY = args.sample_prob
     MAX_DOCUMENT_LENGTH = args.max_doc_length
+    WRITE_BATCHES_TO_FILE = args.write_batches_to_file
 
     paths = []
     # if not using_preprocessed_input: # if we're not using an existing pre-processed input then we need to load json paths
@@ -527,31 +448,11 @@ if __name__ == "__main__":
         for chunk in chunked_paths:
             paths.append(chunk)
         
-        # print_rank_log(str(paths))
-        # try using blendcorpus
-        # os.environ["MASTER_ADDR"] = "localhost"
-        # os.environ["MASTER_PORT"] = '12355'
-        # dist.init_process_group(backend="nccl", rank=0, world_size=1)
-        # config = get_config()
-        # print(config)
-        # config.data_file_list=args.data
-        # init_ret = init_distributed()
-        # mpu.initialize_model_parallel()
-        # config.data_file_list="/home/wkwiecinski/polaris_data/wiki2.txt"
-        # config.seq_length=1000
-        # train,valid,test = build_gpt_datasets(config)
-        # print_rank_log(str(train))
     else: # other processes wait for jsons to process
         paths = []
 
     paths = COMM.scatter(paths, root=0)
 
     # get the corpus metadata
-    clusters = run_corpus_clustering(paths, int(args.threads), args.inference_method, args.model, args.categories, args.temperature, args.max_json_amt, args.tokenized_input)
+    asyncio.run(run_corpus_clustering_with_paths(paths, int(args.threads), args.inference_method, args.model, args.categories, args.temperature, args.max_json_amt, args.tokenized_input))
 
-    # merge step (oh god I'm a physicist)
-    # for i in range(COMM.Get_size()):
-        # with open(OUTFILE, 'a') as combined:
-            # with open(OUTFILE_NAME, 'r') as rank_file:
-                # for line in rank_file.readlines():
-                    # combined.write(line)

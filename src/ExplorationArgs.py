@@ -2,11 +2,21 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 
 SUBSET_CHOICES=["algebraic-stack", "arxiv", "dclm", "open-web-math", "pes2o", "starcoder", "wiki"]
+INFERENCE_CLUSTER=["sophia", "metis"]
 AVAILABLE_MODELS=["openai/gpt-oss-120b", "google/gemma-4-26B-A4B-it", "google/gemma-4-31B-it", "google/gemma-3-27b-it"]
+
+# MODELS = {
+#     "sophia": set(["openai/gpt-oss-120b", "google/gemma-4-26B-A4B-it", "google/gemma-4-31B-it", "google/gemma-3-27b-it"]),
+#     "metis": set(["gpt-oss-120b", "Llama-4-Maverick-17B-128E-Instruct", "gemma-4-31B-it"])
+# }
 
 @dataclass
 class ExplorationArgs:
     # constant options
+    MODELS = {
+        "sophia": set(["openai/gpt-oss-120b", "google/gemma-4-26B-A4B-it", "google/gemma-4-31B-it", "google/gemma-3-27b-it"]),
+        "metis": set(["gpt-oss-120b", "Llama-4-Maverick-17B-128E-Instruct", "gemma-4-31B-it"])
+    }
 
     # data processing arguments
     data: str # path to olmo-mix data
@@ -18,6 +28,7 @@ class ExplorationArgs:
 
     # inference arguments
     inference_method:str="llm" # the type of inference method to use
+    cluster:str="sophia"
     model:str="google/gemma-4-31B-it" # model name to use if using llm inference
     temperature:float=0 # model temperature
     max_doc_length:int=1250 # number of characters to pass to the inference method 
@@ -28,6 +39,9 @@ class ExplorationArgs:
     # clustering arguments
     n_clusters: int=4
     weights_json: str="difficulty-bias.json"
+    max_kmeans_points: int=10_000 # the maximum number of points for updating clusters. Once this limit is reached, centroids become static and new points are fit to the existing centroids.
+    cluster_sample_rate_json: str="cluster-sample-rate.json" # sample rate for cluster labels (experimental)
+    write_batches_to_file: bool=True # write the classified data to a file.
 
 
     # misc args

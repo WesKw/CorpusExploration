@@ -39,7 +39,9 @@ Visualizes document-cluster JSON records of the form:
     "confidence": "<low|medium|high>",
     "difficulty": "<beginner|intermediate|advanced|expert>",
     "prior_knowledge": "<float between 0 and 1>",
-    "tokens": "<number_of_tokens>"
+    "tokens": "<number_of_tokens>",
+    "vocab_complexity": "<complexity>",
+    "sentence_quality": "<sentence_quality>"
 }
 
 Category names are now arbitrary JSON keys (e.g. "machine_learning": "0.82")
@@ -80,7 +82,10 @@ DIFFICULTY_COLORS = {
 }
 
 # Every other key on a record is treated as "<category_name>": "<probability>"
-RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens"}
+RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens", "vocab_complexity", "sentence_quality", "batch_id"}
+_RESERVED_KEYS_NORM = {k.lower().replace(" ", "_").replace("-", "_")
+                       for k in RESERVED_KEYS}
+
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +134,22 @@ def parse_int(value):
         return int(float(value))
     except (TypeError, ValueError):
         return None
+    
+
+def normalise_category_name(name):
+    """Canonical form for a category name: lowercase, whitespace/hyphens/dots
+    replaced with underscores, leading/trailing whitespace stripped, runs of
+    underscores collapsed to one.
+ 
+    "Machine Learning", "machine-learning", "Machine_Learning", and
+    "machine_learning" all map to "machine_learning" so they're treated as
+    the same category even when spelled differently across records."""
+    import re
+    name = str(name).strip().lower()
+    name = re.sub(r"[\s\-\.]+", "_", name)   # spaces / hyphens / dots → _
+    name = re.sub(r"_+", "_", name)           # collapse repeated underscores
+    name = name.strip("_")                    # remove leading/trailing _
+    return name
 
 
 def parse_records(records):
@@ -145,22 +166,31 @@ def parse_records(records):
             "difficulty": (r.get("difficulty") or "unknown").lower(),
             "prior_knowledge": parse_probability(r.get("prior_knowledge")),
             "tokens": parse_int(r.get("tokens")),
-            "location": r.get("location", "None")
+            "location": r.get("location", "None"),
+            "vocab_complexity": parse_probability(r.get("vocab_complexity")),
+            "sentence_quality": parse_probability(r.get("sentence_quality")),
         }
 
         categories = {}
         for key, value in r.items():
-            if key in RESERVED_KEYS:
+            if normalise_category_name(key) in _RESERVED_KEYS_NORM:
                 continue
             prob = parse_probability(value)
-            if prob is not None:
-                categories[key.lower()] = prob
-
+            if prob is None:
+                continue
+            norm_key = normalise_category_name(key)
+            # When two raw keys normalise to the same name, keep the higher
+            # probability rather than silently discarding one or summing
+            # (which could exceed 1.0).
+            if norm_key not in categories or prob > categories[norm_key]:
+                categories[norm_key] = prob
+ 
         item["categories"] = dict(
             sorted(categories.items(), key=lambda kv: kv[1], reverse=True)
         )
         parsed.append(item)
     return parsed
+
 
 
 def category_at_rank(item, rank):
@@ -362,6 +392,68 @@ def plot_difficulty_by_category(parsed, ax, top_n=10):
               bbox_to_anchor=(0, -0.32), ncol=4, framealpha=0.9)
 
 
+def plot_quality_metrics_by_category(parsed, ax, top_n=10):
+    """Grouped box plots of prior_knowledge, vocab_complexity, and
+    sentence_quality for each of the top-N primary categories, so these
+    three continuous quality signals can be compared side by side across
+    a handful of the most common topics. Uses the same top-N category
+    selection/order as plot_top_categories for cross-reference."""
+    counter = primary_category_counts(parsed)
+    top_names = [name for name, _ in counter.most_common(top_n)]
+
+    metrics = [
+        ("prior_knowledge", "#4C72B0"),
+        ("vocab_complexity", "#DD8452"),
+        ("sentence_quality", "#55A868"),
+    ]
+    box_width = 0.8 / len(metrics)
+
+    doc_top = [(top_category(p)[0], p) for p in parsed]
+
+    present_names = []
+    data_by_metric = {m: [] for m, _ in metrics}
+    positions_by_metric = {m: [] for m, _ in metrics}
+    for name in top_names:
+        docs = [p for cat, p in doc_top if cat == name]
+        if not docs:
+            continue
+        base = len(present_names)
+        present_names.append(name)
+        for mi, (metric, _) in enumerate(metrics):
+            vals = [p[metric] for p in docs if p[metric] is not None]
+            data_by_metric[metric].append(vals)
+            offset = (mi - (len(metrics) - 1) / 2) * box_width
+            positions_by_metric[metric].append(base + offset)
+
+    if not present_names:
+        ax.axis("off")
+        return
+
+    for metric, color in metrics:
+        pairs = [(vals, pos) for vals, pos in
+                 zip(data_by_metric[metric], positions_by_metric[metric]) if vals]
+        if not pairs:
+            continue
+        vals, positions = zip(*pairs)
+        bp = ax.boxplot(vals, positions=positions, widths=box_width * 0.85,
+                         patch_artist=True, showfliers=False)
+        for box in bp["boxes"]:
+            box.set_facecolor(color)
+            box.set_alpha(0.7)
+        for median in bp["medians"]:
+            median.set_color("black")
+
+    ax.set_xticks(range(len(present_names)))
+    ax.set_xticklabels(present_names, rotation=45, ha="right")
+    ax.set_xlim(-0.6, len(present_names) - 0.4)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylabel("Score")
+    ax.set_title(f"Quality metric spread across top {len(present_names)} categories")
+
+    handles = [mpatches.Patch(color=c, label=m.replace("_", " ")) for m, c in metrics]
+    ax.legend(handles=handles, fontsize=7, loc="upper right")
+
+
 def plot_summary_text(parsed, ax, fig):
     ax.axis("off")
     n = len(parsed)
@@ -385,16 +477,17 @@ def plot_summary_text(parsed, ax, fig):
 # ---------------------------------------------------------------------------
 
 def build_dashboard(parsed, out_path):
-    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(20, 14))
 
     plot_top_categories(parsed, axes[0, 0])
     plot_confidence_distribution(parsed, axes[0, 1])
     plot_difficulty_distribution(parsed, axes[0, 2])
-    plot_tokens_by_category(parsed, axes[0, 3])
-    plot_prior_knowledge_vs_difficulty(parsed, axes[1, 0])
-    plot_category_probability_box(parsed, axes[1, 1])
-    plot_summary_text(parsed, axes[1, 2], fig)
-    plot_difficulty_by_category(parsed, axes[1, 3])
+    plot_tokens_by_category(parsed, axes[1, 0])
+    plot_prior_knowledge_vs_difficulty(parsed, axes[1, 1])
+    plot_category_probability_box(parsed, axes[1, 2])
+    plot_difficulty_by_category(parsed, axes[2, 0])
+    plot_quality_metrics_by_category(parsed, axes[2, 1])
+    plot_summary_text(parsed, axes[2, 2], fig)
 
     fig.suptitle("Document Cluster Overview", fontsize=16, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])

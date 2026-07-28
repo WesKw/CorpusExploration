@@ -1,9 +1,9 @@
 {
     "wiki": 0.0013,
     "arxiv": 0.0013,
-    "algebraic-stack": 0.00013,
+    "algebraic-stack": 0.0013,
     "open-web-math": 0.004,
     "starcoder": 0.0013,
-    "dclm": 0.0004,
-    "pes2o": 0.0004
+    "dclm": 0.0008,
+    "pes2o": 0.0008
 }

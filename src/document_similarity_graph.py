@@ -20,8 +20,11 @@ Can you modify document_similarity_graph.py to use plotly instead of matplotlib 
 5)
 For document_similarity_graph.py, could you include the prior knowledge and content difficulty in the build_matrix function?
 
-document_similarity_graph.py
+6)
+document_similarity_graph.py is very slow with large amounts of documents (20,000+)
 
+document_similarity_graph.py
+ 
 Builds an interactive undirected graph showing how "close" documents are to
 one another, based on the categories (and probabilities) assigned to each
 document by the clustering pipeline, plus - optionally - how similar their
@@ -34,13 +37,13 @@ encoded beginner..expert) and a prior_knowledge dimension, each scaled by a
 tunable weight so two documents on completely different topics but at the
 same difficulty/depth can register as weakly related, without that swamping
 genuine topical overlap.
-
+ 
 Renders with Plotly instead of matplotlib, so the output is a self-contained
 HTML file you can open in a browser: scroll to zoom, drag to pan, hover any
 document for its title/categories/difficulty/confidence/prior knowledge/
 token count, and click a legend entry to toggle that community or difficulty
 level on/off.
-
+ 
 Scales from a handful of documents up to several thousand: layout uses
 ForceAtlas2 (much better at separating clusters than spring layout at
 scale), node/edge sizing shrinks automatically as the document count grows,
@@ -49,11 +52,11 @@ once there are more documents than would fit legibly - rather than printing
 every single title on top of each other. A dashed circle is drawn around
 each detected cluster and labeled with its primary category (the category
 most often the top pick among that cluster's documents).
-
+ 
 Requires: networkx, plotly, numpy
 Reuses the JSON loading/parsing from visualize_clusters.py (keep both files
 in the same folder).
-
+ 
 Usage:
     python document_similarity_graph.py records.json
     python document_similarity_graph.py records.json --method knn --k 3
@@ -64,8 +67,8 @@ Usage:
     python document_similarity_graph.py records.json --min-circle-size 5
     python document_similarity_graph.py records.json --show-weights
     python document_similarity_graph.py records.json --cdn   # smaller file, needs internet to view
-    python document_similarity_graph.py records.json --difficulty-weight 0 --prior-knowledge-weight 0  # categories only, as before
 """
+
 
 import argparse
 import textwrap
@@ -75,6 +78,7 @@ import networkx as nx
 import numpy as np
 import plotly.colors as pc
 import plotly.graph_objects as go
+import json
 
 from visualize_clusters import (
     DIFFICULTY_ORDER,
@@ -123,15 +127,15 @@ def difficulty_to_signed(difficulty):
     return 0.0
 
 
-def prior_knowledge_to_signed(prior_knowledge):
-    """0.0 prior knowledge -> -1.0, 1.0 -> +1.0, missing -> 0.0 (neutral).
+def center_normalized_range(value):
+    """0.0 -> -1.0, 1.0 -> +1.0, missing -> 0.0 (neutral).
     Same centering rationale as difficulty_to_signed."""
-    if prior_knowledge is None:
+    if value is None:
         return 0.0
-    return (prior_knowledge - 0.5) * 2
+    return (value - 0.5) * 2
 
 
-def build_matrix(parsed, vocab, difficulty_weight=0.5, prior_knowledge_weight=0.5):
+def build_matrix(parsed, vocab, weights:dict={}):
     """Rows = documents, columns = [one per category, then difficulty,
     then prior_knowledge]. Category columns hold the assigned probability
     (0 if a document wasn't assigned that category). The two metadata
@@ -146,51 +150,83 @@ def build_matrix(parsed, vocab, difficulty_weight=0.5, prior_knowledge_weight=0.
     default to 0.5 so difficulty/depth nudges which documents look close
     without overriding genuine topical overlap. Set a weight to 0 to drop
     that signal entirely (matching the old categories-only behavior)."""
+    init_weights = {
+        "category": 1.0,
+        "difficulty": 0.5,
+        "prior_knowledge": 0.5,
+        "vocab_complexity": 0.5,
+        "sentence_quality": 0.5
+    }
+
+    if weights:
+        init_weights = weights
+
     index = {name: i for i, name in enumerate(vocab)}
-    n_cols = len(vocab) + 2
-    difficulty_col, prior_knowledge_col = len(vocab), len(vocab) + 1
+    n_cols = len(vocab) + 4
+    difficulty_col, prior_knowledge_col, vocab_col, sentence_col = len(vocab), len(vocab) + 1, len(vocab) + 2, len(vocab) + 3
 
     matrix = np.zeros((len(parsed), n_cols))
     for row, p in enumerate(parsed):
         for name, prob in p["categories"].items():
             col = index.get(name)
             if col is not None:
-                matrix[row, col] = prob
+                matrix[row, col] = prob * init_weights.get("category", 0.5)
 
-        matrix[row, difficulty_col] = difficulty_to_signed(p.get("difficulty")) * difficulty_weight
-        matrix[row, prior_knowledge_col] = prior_knowledge_to_signed(p.get("prior_knowledge")) * prior_knowledge_weight
+        matrix[row, difficulty_col] = difficulty_to_signed(p.get("difficulty")) * init_weights.get("difficulty", 0.5)
+        matrix[row, prior_knowledge_col] = center_normalized_range(p.get("prior_knowledge")) * init_weights.get("prior_knowledge", 0.5)
+        matrix[row, vocab_col] = center_normalized_range(p.get("vocab_complexity")) * init_weights.get("vocab_complexity", 0.5)
+        matrix[row, sentence_col] = center_normalized_range(p.get("sentence_quality")) * init_weights.get("sentence_quality", 0.5)
 
     return matrix
 
-
-def cosine_similarity_matrix(matrix):
-    """Pairwise cosine similarity between document rows. Docs with an
-    all-zero vector (no parsed categories) get similarity 0 with everyone."""
+def _normalise(matrix):
+    """L2-normalise rows in-place and return the result. Rows that are all
+    zeros (no categories, no metadata) stay at zero so they register zero
+    similarity with everything rather than NaN."""
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    safe_norms = np.where(norms == 0, 1, norms)  # avoid divide-by-zero
-    normalized = matrix / safe_norms
-    sim = normalized @ normalized.T
-    zero_rows = (norms.flatten() == 0)
+    safe = np.where(norms == 0, 1, norms)
+    return matrix / safe
+ 
+ 
+def cosine_similarity_matrix(matrix):
+    """Full n×n pairwise cosine similarity matrix. Only suitable for small
+    datasets (≲2 000 docs) - at larger scales the O(n²) memory becomes a
+    bottleneck. The main pipeline uses `build_graph` directly which batches
+    the computation and never materialises this matrix."""
+    norm_m = _normalise(matrix)
+    sim = norm_m @ norm_m.T
+    zero_rows = (np.linalg.norm(matrix, axis=1) == 0)
     sim[zero_rows, :] = 0
     sim[:, zero_rows] = 0
-    np.fill_diagonal(sim, 0)  # no self-similarity edges
+    np.fill_diagonal(sim, 0)
     return sim
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
-# Graph construction
+# Graph construction — batched to avoid O(n²) memory
 # ---------------------------------------------------------------------------
-
-def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
-    """method='knn' (default): connect each document to its top-`k` most
-    similar documents (the union of these directed choices, since the graph
-    is undirected). Edge count is bounded by k*n regardless of dataset size,
-    which is what keeps this readable on large collections.
-    method='threshold': connect any pair above `threshold` instead - flexible,
-    but on a large/diverse collection a low threshold can produce O(n^2)
-    edges and an unreadable "hairball"."""
+ 
+# Number of rows to process per matmul chunk.  512 × n floats fits comfortably
+# in RAM for any realistic vocabulary/n combination, while being large enough
+# to keep BLAS utilisation high.
+_BATCH_SIZE = 512
+ 
+ 
+def build_graph(parsed, matrix, method="knn", threshold=0.15, k=3):
+    """Build the similarity graph directly from the embedding matrix, in
+    batches that never materialise more than _BATCH_SIZE × n floats at once.
+ 
+    method='knn' (default): connect each document to its top-`k` most
+    similar documents. Edge count is bounded by k×n regardless of dataset
+    size, which is what keeps the graph readable on large collections.
+    argpartition selects the top-k in O(n) per row instead of the O(n log n)
+    argsort used previously.
+ 
+    method='threshold': connect any pair whose cosine similarity is at least
+    `threshold`. Edge count is potentially O(n²) on a large, diverse dataset
+    with a low threshold - the hairball warning in build_similarity_figure
+    will fire if this happens."""
     G = nx.Graph()
-
     for i, p in enumerate(parsed):
         G.add_node(
             i,
@@ -199,53 +235,95 @@ def build_graph(parsed, sim, method="knn", threshold=0.15, k=3):
             confidence=p["confidence"],
             prior_knowledge=p["prior_knowledge"],
             tokens=p.get("tokens"),
+            sentence_quality=p.get("sentence_quality"),
+            vocab_complexity=p.get("vocab_complexity"),
             categories=p["categories"],
         )
-
+ 
     n = len(parsed)
-    if method == "knn":
-        for i in range(n):
-            order = np.argsort(-sim[i])  # descending similarity
-            added = 0
-            for j in order:
-                if j == i or sim[i, j] <= 0:
-                    continue
-                G.add_edge(i, j, weight=float(sim[i, j]))
-                added += 1
-                if added >= k:
-                    break
-    else:  # threshold
-        for i in range(n):
-            for j in range(i + 1, n):
-                if sim[i, j] >= threshold:
-                    G.add_edge(i, j, weight=float(sim[i, j]))
-
+    norm_m = _normalise(matrix.copy())
+ 
+    for start in range(0, n, _BATCH_SIZE):
+        end = min(start + _BATCH_SIZE, n)
+        sims = norm_m[start:end] @ norm_m.T  # (batch, n)
+ 
+        if method == "knn":
+            for bi in range(end - start):
+                doc_i = start + bi
+                row = sims[bi]
+                row[doc_i] = -np.inf  # exclude self-loop
+                # argpartition: O(n) partial sort — only guarantees top-k
+                # are in the last k slots, so sort those k slots explicitly.
+                top_idx = np.argpartition(row, -k)[-k:]
+                top_idx = top_idx[np.argsort(-row[top_idx])]
+                for j in top_idx:
+                    w = float(row[j])
+                    if w > 0:
+                        G.add_edge(doc_i, int(j), weight=w)
+        else:  # threshold
+            rows, cols = np.where(sims >= threshold)
+            for bi, j in zip(rows, cols):
+                doc_i = start + bi
+                if doc_i < int(j):  # add each undirected edge only once
+                    G.add_edge(doc_i, int(j), weight=float(sims[bi, j]))
+ 
     return G
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Layout & community detection (unchanged from the matplotlib version -
 # networkx positions are just (x, y) coordinates, equally usable by Plotly)
 # ---------------------------------------------------------------------------
-
+ 
 def truncate(text, width=22):
     return textwrap.shorten(text, width=width, placeholder="…")
-
-
+ 
+ 
 def compute_layout(G, layout, seed=42):
-    """ForceAtlas2 separates dense clusters far more cleanly than spring
-    layout once you're past a couple hundred nodes, and it's also faster -
-    it's the default for that reason, but spring layout is kept available
-    since it can look a little smoother on small graphs."""
-    if G.number_of_nodes() == 0:
+    """Choose and run a layout algorithm.
+ 
+    layout='auto' (recommended):
+      - n ≤ 1 000: ForceAtlas2 (best visual cluster separation, Python O(n²)
+        per iter is acceptable at this scale)
+      - n > 1 000: sfdp via graphviz (C implementation with Barnes-Hut
+        O(n log n) per iter, scales to hundreds of thousands of nodes)
+ 
+    layout='forceatlas2': always use ForceAtlas2 (slow above ~2 000 nodes)
+    layout='sfdp':        always use sfdp (requires pygraphviz)
+    layout='spring':      scipy Fruchterman-Reingold (same O(n²) caveat as fa2)
+    """
+    n = G.number_of_nodes()
+    if n == 0:
         return {}
-    if layout == "spring":
-        return nx.spring_layout(G, weight="weight", seed=seed, k=1.2)
-    return nx.forceatlas2_layout(
-        G, max_iter=250, seed=seed, weight="weight", scaling_ratio=8.0, gravity=0.3
-    )
-
-
+ 
+    use_sfdp = (layout == "sfdp") or (layout == "auto" and n > 1000)
+ 
+    if use_sfdp:
+        try:
+            print(f"  layout: sfdp (graphviz Barnes-Hut, n={n}) ...", flush=True)
+            # Pass edge weights so similar documents attract more strongly
+            nx.set_edge_attributes(G, {(u, v): str(round(d["weight"], 3))
+                                       for u, v, d in G.edges(data=True)}, "len")
+            return nx.nx_agraph.graphviz_layout(G, prog="sfdp", args="-GK=0.5")
+        except Exception as e:
+            print(f"  sfdp failed ({e}), falling back to spectral layout")
+            return nx.spectral_layout(G)
+ 
+    if layout in ("forceatlas2", "auto"):
+        # Scale iterations down for larger graphs so the layout stays
+        # under ~30s even if someone explicitly requests fa2 on a big graph.
+        max_iter = max(50, min(250, int(500_000 / max(n, 1))))
+        print(f"  layout: ForceAtlas2 ({max_iter} iter, n={n}) ...", flush=True)
+        return nx.forceatlas2_layout(
+            G, max_iter=max_iter, seed=seed, weight="weight",
+            scaling_ratio=8.0, gravity=0.3,
+        )
+ 
+    # spring
+    print(f"  layout: spring (n={n}) ...", flush=True)
+    return nx.spring_layout(G, weight="weight", seed=seed, k=1.2)
+ 
+ 
 def detect_communities(G):
     """Greedy modularity communities - used both for optional color-by and
     for choosing a representative node per cluster when there are too many
@@ -253,8 +331,8 @@ def detect_communities(G):
     if G.number_of_edges() == 0:
         return [{n} for n in G.nodes]
     return list(nx.community.greedy_modularity_communities(G, weight="weight"))
-
-
+ 
+ 
 def cluster_primary_category(G, members):
     """The category that best represents a cluster: whichever category is
     most often each member's own top (highest-probability) category, with
@@ -273,8 +351,8 @@ def cluster_primary_category(G, members):
     top_count = max(counts.values())
     candidates = [name for name, c in counts.items() if c == top_count]
     return candidates[0] if len(candidates) == 1 else max(candidates, key=lambda n: prob_sum[n])
-
-
+ 
+ 
 def compute_cluster_circles(G, pos, communities, min_size=3, spread_percentile=75):
     """One circle per community with at least `min_size` members: centered
     on the member centroid, sized to cover most members (a percentile,
@@ -286,11 +364,11 @@ def compute_cluster_circles(G, pos, communities, min_size=3, spread_percentile=7
     below `min_size` are skipped here."""
     if not pos:
         return []
-
+ 
     all_pts = np.array(list(pos.values()))
     diag = np.linalg.norm(all_pts.max(axis=0) - all_pts.min(axis=0)) if len(all_pts) > 1 else 1.0
     floor_radius = max(diag * 0.015, 1e-6)
-
+ 
     circles = []
     for comm_index, comm in enumerate(communities):
         if len(comm) < min_size:
@@ -307,12 +385,12 @@ def compute_cluster_circles(G, pos, communities, min_size=3, spread_percentile=7
             "label": f"{category or '(no category)'}  ({len(comm)})",
         })
     return circles
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Plotly rendering
 # ---------------------------------------------------------------------------
-
+ 
 def node_hover_text(G, node):
     title = G.nodes[node]["title"]
     cats = G.nodes[node].get("categories") or {}
@@ -321,32 +399,41 @@ def node_hover_text(G, node):
     pk_str = f"{pk:.2f}" if pk is not None else "n/a"
     tokens = G.nodes[node].get("tokens")
     tokens_str = f"{tokens:,}" if tokens is not None else "n/a"
+    qual_str = G.nodes[node].get("sentence_quality", "None")
+    vocab_str = G.nodes[node].get("vocab_complexity", "None")
     return (
         f"<b>{title}</b><br>"
         f"Categories:<br>{cat_lines or '&nbsp;&nbsp;(none)'}<br>"
         f"Difficulty: {G.nodes[node]['difficulty']}<br>"
         f"Confidence: {G.nodes[node]['confidence']}<br>"
         f"Prior knowledge: {pk_str}<br>"
-        f"Tokens: {tokens_str}"
+        f"Tokens: {tokens_str}<br>"
+        f"Sentence Quality: {qual_str}<br>"
+        f"Vocab Complexity {vocab_str}<br>"
     )
-
-
+ 
+ 
 def node_size(G, node, n_nodes):
     """Marker diameter shrinks as the document count grows, so a few
     hundred documents don't render as one solid mass of overlapping dots."""
     size_scale = max(4, min(34, 700 / n_nodes))
     pk = G.nodes[node]["prior_knowledge"]
     return size_scale * (0.7 + (pk if pk is not None else 0.3))
-
-
+ 
+ 
 def build_node_traces(G, communities, pos, color_by, max_labels):
     """One Plotly trace per color group (community or difficulty level)
     rather than one trace for the whole graph - this is what makes legend
     entries clickable to isolate/hide a given cluster or difficulty level,
-    a level of interactivity a static matplotlib plot can't offer."""
+    a level of interactivity a static matplotlib plot can't offer.
+ 
+    Uses go.Scattergl (WebGL) instead of go.Scatter (SVG) when there are
+    more than 5 000 nodes - the browser's SVG renderer bogs down well before
+    then, while WebGL handles hundreds of thousands of points smoothly."""
     n = G.number_of_nodes()
     show_text = n <= max_labels
-
+    TraceType = go.Scattergl if n > 5000 else go.Scatter
+ 
     if color_by == "community":
         groups = [(ci, list(comm)) for ci, comm in enumerate(communities) if comm]
         def color_for(key):
@@ -363,10 +450,10 @@ def build_node_traces(G, communities, pos, color_by, max_labels):
             return _DIFFICULTY_COLORS.get(key, "#999999")
         def name_for(key, nodes):
             return key
-
+ 
     traces = []
     for key, nodes in groups:
-        traces.append(go.Scatter(
+        traces.append(TraceType(
             x=[pos[node][0] for node in nodes],
             y=[pos[node][1] for node in nodes],
             mode="markers+text" if show_text else "markers",
@@ -383,8 +470,8 @@ def build_node_traces(G, communities, pos, color_by, max_labels):
             name=str(name_for(key, nodes)),
         ))
     return traces
-
-
+ 
+ 
 def build_edge_traces(G, pos, n_buckets=4):
     """Edges are bucketed into a handful of width/opacity tiers by weight
     rather than given a literal per-edge style - Plotly traces don't support
@@ -393,17 +480,17 @@ def build_edge_traces(G, pos, n_buckets=4):
     edges = list(G.edges(data=True))
     if not edges:
         return []
-
+ 
     n_nodes = G.number_of_nodes()
     max_w = max(d["weight"] for _, _, d in edges) or 1.0
     base_width = max(0.4, min(3.0, 250 / n_nodes))
     base_alpha = max(0.06, min(0.5, 60 / n_nodes))
-
+ 
     buckets = [[] for _ in range(n_buckets)]
     for u, v, d in edges:
         idx = min(int((d["weight"] / max_w) * n_buckets), n_buckets - 1)
         buckets[idx].append((u, v))
-
+ 
     traces = []
     for i, bucket in enumerate(buckets):
         if not bucket:
@@ -421,8 +508,8 @@ def build_edge_traces(G, pos, n_buckets=4):
             hoverinfo="skip", showlegend=False,
         ))
     return traces
-
-
+ 
+ 
 def build_edge_hover_trace(G, pos):
     """An invisible-ish marker at each edge's midpoint, purely so hovering
     near an edge shows its similarity score - Plotly has no native per-
@@ -437,8 +524,8 @@ def build_edge_hover_trace(G, pos):
         marker=dict(size=5, color="rgba(80,80,80,0.35)"),
         hovertext=texts, hoverinfo="text", showlegend=False,
     )
-
-
+ 
+ 
 def add_cluster_circles(fig, G, pos, communities, min_circle_size):
     circles = compute_cluster_circles(G, pos, communities, min_size=min_circle_size)
     for c in sorted(circles, key=lambda c: c["radius"], reverse=True):
@@ -456,8 +543,8 @@ def add_cluster_circles(fig, G, pos, communities, min_circle_size):
             font=dict(color=color, size=11), yshift=10,
             bgcolor="rgba(255,255,255,0.85)",
         )
-
-
+ 
+ 
 def build_figure(G, layout="forceatlas2", color_by="auto", max_labels=40,
                  show_weights=False, cluster_circles=True, min_circle_size=3):
     if G.number_of_nodes() == 0:
@@ -465,36 +552,36 @@ def build_figure(G, layout="forceatlas2", color_by="auto", max_labels=40,
         fig.update_layout(annotations=[dict(text="No documents to display",
                                             showarrow=False, font=dict(size=16))])
         return fig
-
+ 
     n = G.number_of_nodes()
     color_by = ("community" if n > max_labels else "difficulty") if color_by == "auto" else color_by
-
+ 
     pos = compute_layout(G, layout)
     communities = detect_communities(G)
-
+ 
     fig = go.Figure()
     for trace in build_edge_traces(G, pos):
         fig.add_trace(trace)
-
+ 
     if show_weights:
         if G.number_of_edges() > 200:
             print("Skipping --show-weights: too many edges to annotate legibly "
                   "(use a sparser graph - higher --threshold or lower --k).")
         else:
             fig.add_trace(build_edge_hover_trace(G, pos))
-
+ 
     for trace in build_node_traces(G, communities, pos, color_by, max_labels):
         fig.add_trace(trace)
-
+ 
     if cluster_circles:
         add_cluster_circles(fig, G, pos, communities, min_circle_size)
-
+ 
     if color_by == "community":
         title = (f"Document similarity graph - {n} documents, "
                  f"color = detected community ({len(communities)} found)")
     else:
         title = f"Document similarity graph - {n} documents, color = difficulty"
-
+ 
     fig.update_layout(
         title=dict(text=title, font=dict(size=16)),
         xaxis=dict(visible=False, showgrid=False, zeroline=False),
@@ -508,43 +595,50 @@ def build_figure(G, layout="forceatlas2", color_by="auto", max_labels=40,
         height=850,
     )
     return fig
-
-
+ 
+ 
 def build_similarity_figure(parsed, out_path, method="knn", threshold=0.15, k=3,
-                            layout="forceatlas2", color_by="auto", max_labels=40,
+                            layout="auto", color_by="auto", max_labels=40,
                             show_weights=False, cluster_circles=True, min_circle_size=3,
-                            use_cdn=False, difficulty_weight=0.5, prior_knowledge_weight=0.5):
+                            use_cdn=False, weights={}):
+    import time
+    n = len(parsed)
+ 
+    t0 = time.time()
     vocab = build_vocab(parsed)
     if not vocab:
         raise SystemExit("No category names found in the input - can't compute similarity.")
-
-    matrix = build_matrix(parsed, vocab, difficulty_weight=difficulty_weight,
-                          prior_knowledge_weight=prior_knowledge_weight)
-    sim = cosine_similarity_matrix(matrix)
-    G = build_graph(parsed, sim, method=method, threshold=threshold, k=k)
-
+    matrix = build_matrix(parsed, vocab, weights=weights)
+    print(f"  matrix: {n} docs × {matrix.shape[1]} dims ({time.time()-t0:.1f}s)", flush=True)
+ 
+    t0 = time.time()
+    G = build_graph(parsed, matrix, method=method, threshold=threshold, k=k)
+    print(f"  graph:  {G.number_of_nodes()} nodes, {G.number_of_edges()} edges ({time.time()-t0:.1f}s)", flush=True)
+ 
     n_edges = G.number_of_edges()
     isolated = list(nx.isolates(G))
     if isolated:
-        print(f"Note: {len(isolated)} document(s) have no edges above the "
-              f"current threshold/k and will appear as unconnected dots.")
-    if method == "threshold" and n_edges > 8 * G.number_of_nodes():
-        print(f"Note: {n_edges} edges for {G.number_of_nodes()} documents is dense "
-              f"- consider raising --threshold, or switch to --method knn, for a "
-              f"clearer picture.")
-
+        print(f"  note: {len(isolated)} document(s) have no edges and will appear as unconnected dots.")
+    if method == "threshold" and n_edges > 8 * n:
+        print(f"  note: {n_edges} edges for {n} documents is dense - consider raising "
+              f"--threshold or switching to --method knn for a clearer picture.")
+ 
+    t0 = time.time()
     fig = build_figure(G, layout=layout, color_by=color_by, max_labels=max_labels,
                        show_weights=show_weights, cluster_circles=cluster_circles,
                        min_circle_size=min_circle_size)
+    print(f"  figure: built ({time.time()-t0:.1f}s)", flush=True)
+ 
+    t0 = time.time()
     fig.write_html(out_path, include_plotlyjs=("cdn" if use_cdn else True))
-    print(f"Saved interactive similarity graph to {out_path}")
+    print(f"Saved interactive similarity graph to {out_path} ({time.time()-t0:.1f}s)", flush=True)
     return G, fig
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
+ 
 def main():
     parser = argparse.ArgumentParser(description="Visualize document closeness as an interactive undirected graph")
     parser.add_argument("json_path", help="Path to input JSON (array, single object, or JSON-lines)")
@@ -558,9 +652,12 @@ def main():
                         help="Minimum cosine similarity to draw an edge (method=threshold)")
     parser.add_argument("--k", type=int, default=3,
                         help="Number of nearest neighbors per document (method=knn)")
-    parser.add_argument("--layout", choices=["forceatlas2", "spring"], default="forceatlas2",
-                        help="forceatlas2 (default) separates clusters better at scale; "
-                             "spring can look slightly cleaner on small graphs")
+    parser.add_argument("--layout", choices=["auto", "forceatlas2", "sfdp", "spring"],
+                        default="auto",
+                        help="auto (default): ForceAtlas2 for n≤1000, sfdp (graphviz "
+                             "Barnes-Hut) above that. forceatlas2: always use fa2 (slow "
+                             "above ~2000 docs). sfdp: always use graphviz (fast, requires "
+                             "pygraphviz). spring: Fruchterman-Reingold (also O(n²)).")
     parser.add_argument("--color-by", choices=["auto", "difficulty", "community"], default="auto",
                         help="auto (default): difficulty for small graphs, detected "
                              "community once there are too many documents to label "
@@ -580,32 +677,28 @@ def main():
     parser.add_argument("--cdn", action="store_true",
                         help="Load plotly.js from a CDN instead of embedding it - much "
                              "smaller HTML file, but needs an internet connection to view")
-    parser.add_argument("--difficulty-weight", type=float, default=0.5,
-                        help="How much a shared difficulty level (beginner..expert) "
-                             "contributes to similarity, relative to category overlap. "
-                             "0 disables it entirely, matching the old categories-only "
-                             "behavior (default 0.5)")
-    parser.add_argument("--prior-knowledge-weight", type=float, default=0.5,
-                        help="How much similar prior-knowledge requirements contribute "
-                             "to similarity, relative to category overlap. 0 disables "
-                             "it entirely (default 0.5)")
+    parser.add_argument("--custom-weights", type=str, default="", help="File containing custom weights for categories.")
     args = parser.parse_args()
-
+ 
     records = load_records(args.json_path)
     parsed = parse_records(records)
-
+    
+    weights = {}
+    if args.custom_weights:
+        with open(args.custom_weights) as json_weights:
+            weights = json.load(json_weights)
+ 
     if not parsed:
         raise SystemExit("No records found in the input file.")
-
+ 
     build_similarity_figure(
         parsed, args.out, method=args.method, threshold=args.threshold, k=args.k,
         layout=args.layout, color_by=args.color_by, max_labels=args.max_labels,
         show_weights=args.show_weights, cluster_circles=not args.no_cluster_circles,
         min_circle_size=args.min_circle_size, use_cdn=args.cdn,
-        difficulty_weight=args.difficulty_weight,
-        prior_knowledge_weight=args.prior_knowledge_weight,
+        weights=weights,
     )
-
-
+ 
+ 
 if __name__ == "__main__":
     main()

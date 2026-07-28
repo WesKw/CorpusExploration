@@ -1,6 +1,7 @@
 {
-    "difficulty": 1.0,
-    "prior-knowledge": 1.0,
+    "difficulty": 0.75,
+    "prior_knowledge": 1.0,
     "vocab_complexity": 1.0,
-    "category": 0.25
+    "sentence_quality": 0.75,
+    "category": 0.50
 }
