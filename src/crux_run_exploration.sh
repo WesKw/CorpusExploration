@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -l select=10:system=crux
 #PBS -l place=scatter
-#PBS -l walltime=12:00:00
+#PBS -l walltime=14:00:00
 #PBS -l filesystems=home:eagle
 #PBS -q preemptable
 #PBS -A datascience_collab
@@ -13,7 +13,7 @@ model="gemma-4-31B-it"
 sampleprob=0.001
 temp=0
 threads=4
-max_jsons=25
+max_jsons=100
 max_doc_length=2000
 outfile="out$PBS_JOBID.txt"
 sample_prob_json="./sample_rates.json"
@@ -38,8 +38,6 @@ mpiexec -n 10 python exploration.py \
     --max_json_amt $max_jsons --max_doc_length $max_doc_length --outfile $out \
     --subset_sample_prob_file $sample_prob_json --cluster $cluster
 
-orderings=()
-dataset_dir="$save_dir/"
 # python ordering_step.py "$save_dir/*_rank?.txt" --outfile "$out"
 # python visualize_clusters.py "$out" --out "cluster_dashboard_$PBS_JOBID.png"
 # python document_similarity_graph.py $out --method "knn" --k "15" --out "similarity_graph_$PBS_JOBID.html"
