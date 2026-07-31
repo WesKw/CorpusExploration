@@ -35,6 +35,7 @@ DEFAULT_SAMPLE_PROBABILITY=1.0
 OUTFILE_NAME="output.txt"
 OUTFILE_LOG=""
 OUTFILE="jsons_merged.txt"
+FAILED_LOG=""
 OUTFILE_DUMP=""
 PER_FILE_SAMPLE_RATES={}
 CLUSTERING_WEIGHTS={}
@@ -72,30 +73,36 @@ def process_json_file(arg):
     data = bytearray() # use a byte array to avoid copying too often
     extension = Path(path).suffix
     if extension == ".gz":
+        start_len = 0
         try:
             # decompress into memory and get the full size
             with gzip.open(path, 'rb') as f:
                 while chunk := f.read(chunk_size):
+                    start_len = len(data)
                     data.extend(chunk)
                     bytes += len(chunk)
         except Exception as exc:
             print_rank_log(f"Error occurred while processing {path}")
             print_rank_log(exc)
+            del data[start_len:]
             bytes = 0
 
     elif extension == ".zstd":
+        start_len = 0
         try:
             with open(path, 'rb') as f:
                 # buf = io.BytesIO(f.read())
                 dctx = zstd.ZstdDecompressor()
                 with dctx.stream_reader(f) as reader:
                     while chunk := reader.read(chunk_size):
+                        start_len = len(data)
                         data.extend(chunk)
                         bytes += len(chunk)     
-            print_rank_log(f"Processed {path}")
+            # print_rank_log(f"Processed {path}")
         except Exception as exc:
             print_rank_log(f"Error occurred while processing {path}")
             print_rank_log(exc)
+            del data[start_len:]
             bytes = 0
 
     else: # probably don't process the file if it's not compressed 
@@ -106,14 +113,22 @@ def process_json_file(arg):
     # Posted by pschill, modified by community. See post 'Timeline' for change history
     # Retrieved 2026-06-15, License - CC BY-SA 4.0
     # decode json data
-    data = data.decode("utf-8")
+    data = data.decode("utf-8-sig")
     decoder = json.JSONDecoder()
     jsons = []
     pos = 0 # use indexer so we don't have to slice the string
     index = 1
     pid = os.getpid()
     while pos < len(data):
-        value, end = decoder.raw_decode(data, pos)
+        value, end = (None, None)
+        try: # attempt to get jsons
+            value, end = decoder.raw_decode(data, pos)
+        except json.decoder.JSONDecodeError as jde:
+            print(jde)
+            with open(FAILED_LOG + f"_{pid}.txt", 'a') as failed:
+                failed.write(str(path) + f" | {jde.msg} [pos: {jde.pos}, lineno: {jde.lineno}, colno: {jde.colno}]\n")
+            break # break out of the file if we fail to process a json, then log the file
+
         # print(value)
         pos = end
         while pos < len(data) and data[pos] in ' \t\n\r':
@@ -132,7 +147,6 @@ def process_json_file(arg):
             value["row_index"] = index
             jsons.append(value)
             index += 1
-
 
     return (path, collection, bytes, len(jsons), jsons)
 
@@ -208,7 +222,7 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
                 break 
 
             except Exception as exc: # client failed
-                print_rank_log("Failure:", exc)
+                print_rank_log(f"Failure: {exc}")
                 # try again with a delay
                 timeout = math.pow(timeout + random.uniform(0, 2), backoff_mult)
                 print_rank_log(f"Sleeping for {timeout}s")
@@ -375,6 +389,7 @@ if __name__ == "__main__":
     OUTFILE_NAME = f"{args.outfile}_rank{RANK}.json" # data for each json row
     OUTFILE_LOG = f"{Path(args.outfile).parents[0]}/rank{RANK}.log"
     OUTFILE_DUMP = f"{args.outfile}_rank{RANK}_dump.json"
+    FAILED_LOG = f"{Path(args.outfile).parents[0]}/FAILED_{RANK}"
 
     cluster = args.cluster
     model = args.model

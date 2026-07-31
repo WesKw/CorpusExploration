@@ -1,22 +1,10 @@
 #!/bin/bash -l
 #PBS -l select=1:system=crux
 #PBS -l place=scatter
-#PBS -l walltime=12:00:00
+#PBS -l walltime=01:00:00
 #PBS -l filesystems=home:eagle
 #PBS -q preemptable
 #PBS -A datascience_collab
-
-# export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/"
-# cluster="metis"
-# model="gemma-4-31B-it"
-# model="openai/gpt-oss-120b"
-# sampleprob=0.001
-# temp=0
-# threads=4
-# max_jsons=25
-# max_doc_length=2000
-# outfile="out$PBS_JOBID.txt"
-# sample_prob_json="./sample_rates.json"
 
 . ~/.corpius/bin/activate
 module load cray-python/3.11.7
