@@ -16,7 +16,7 @@ threads=6
 max_jsons=2000
 max_doc_length=2000
 outfile="out$PBS_JOBID.txt"
-sample_prob_json="./sample_rates.json"
+sample_prob_json="./json_configs/sample_rates.json"
 
 . ~/.corpius/bin/activate
 module load cray-python/3.11.7

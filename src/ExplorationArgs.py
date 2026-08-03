@@ -55,12 +55,12 @@ class ClusterArgs:
     sort:bool=False # Sort the input files before processing.
 
     # cluster args
-    method: Literal["none", "difficulty"] = "none" # The ordering method to use. None -> merges json files as is | difficulty -> Order by document difficulty. | topic -> Order by topic. 
+    method: Literal["none", "difficulty"] = "none" # The ordering method to use. None -> merges json files as is | difficulty -> Order by document difficulty. | topic -> Order by topic. If you would like the order reversed, append "-reverse" to the end of the ordering method name. Ex: "difficulty-reverse"
     reverse: bool=False # Reverse the ordering before writing.
     n_clusters: int=4 # number of clusters to create.
     seed:int=42 # The seed for k means.
     batch_size:int=5000 # batch size for k means.
-    weights_json: str="difficulty-bias.json" # the biases for each text attribute in the json. Non-topic weights are 0.5 by default.
+    weights_json: str="difficulty.json" # the biases for each text attribute in the json. Non-topic weights are 0.5 by default.
     max_kmeans_points: int=-1 # the maximum number of points for updating clusters. Once this limit is reached, centroids become static and new points are fit to the existing centroids. -1 -> all points are used in clustering.
     # cluster_sample_rate_json: str="cluster-sample-rate.json" # sample rate for cluster labels (experimental)
     write_batches_to_file: bool=True # write the classified data to a file.
@@ -69,3 +69,12 @@ class ClusterArgs:
     outfile:str="output.json" # The final, merged json file name.
 
     # parser.add_argument("--ordering-method", help="The method to use when ordering clustered data.", choices=["none", "difficulty"])
+
+
+@dataclass
+class DashboardArgs:
+    ezpz_logs_glob: str # glob pattern for the training logs
+    output_dir: str # directory to save the dashboard files
+    ezpz_metrics:list=field(default_factory=lambda: ["loss", "grad_norm"])
+    # lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag", "gsm8k", "mathqa", "code_eval"])
+    lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag"])

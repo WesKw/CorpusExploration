@@ -107,7 +107,7 @@ def parse_records(records, print_num_docs:bool=False):
             "vocab_complexity": r.get("vocab_complexity", "None"),
             "rank": r.get("rank"),
             "pid": r.get("pid"),
-            "row": r.get("idx"),
+            "idx": r.get("idx"),
         }
 
         categories = {}
@@ -177,7 +177,7 @@ def _cluster_step(kmeans, batch: list, random_seed: int, vocab):
             matrix[row, prior_knowledge_col] = prior_knowledge_to_signed(p.get("prior_knowledge")) * CLUSTERING_WEIGHTS.get("prior_knowledge", 0.5)
             matrix[row, vocab_complexity_col] = vocab_complexity_to_signed(p.get("vocab_complexity")) * CLUSTERING_WEIGHTS.get("vocab_complexity", 0.5)
 
-            matrix[row, row_index_col] = p["row"] if p["row"] is not None else np.nan
+            matrix[row, row_index_col] = p["idx"] if p["idx"] is not None else np.nan
             matrix[row, rank_col] = p["rank"] if p["rank"] is not None else np.nan
             matrix[row, pid_col] = p["pid"] if p["pid"] is not None else np.nan
 
@@ -241,7 +241,7 @@ def cluster_step(args, json_paths) -> list:
             for row, dist in zip(ordered_rows, ordered_distances):
                 records.append({
                     "distance": float(dist),
-                    "row": None if np.isnan(matrix[row, row_index_col]) else int(matrix[row, row_index_col]),
+                    "idx": None if np.isnan(matrix[row, row_index_col]) else int(matrix[row, row_index_col]),
                     "rank": None if np.isnan(matrix[row, rank_col]) else int(matrix[row, rank_col]),
                     "pid": None if np.isnan(matrix[row, pid_col]) else int(matrix[row, pid_col]),
                 })
@@ -253,14 +253,8 @@ def cluster_step(args, json_paths) -> list:
         return
 
     """Clusters all documents and saves them as a list."""
-    json_files = ... 
-
-    # if no ordering step was specifed just return an empty list.
-    if args.method == "none":
-        return []
-
     jsons = []
-    # otherwise, we need to load the data from each json (excluding text)
+    # load the data from each json (excluding text)
     # but, we need to save an index so we know which document line contains
     # what text we need for writing to the final file.
     for file in json_paths:
@@ -272,12 +266,18 @@ def cluster_step(args, json_paths) -> list:
     # this is inefficient but fine for now
     parsed = parse_records(jsons, print_num_docs=True)
     vocab = build_vocab(parsed)
+
+    # if no ordering step was specifed just return the loaded jsons
+    if args.method == "none" or args.method == "shuffled":
+        return jsons
+
     matrix = np.array([])
 
     # here, we do the actual clustering step
     kmeans = MiniBatchKMeans(n_clusters=args.n_clusters, random_state=args.seed, batch_size=args.batch_size, n_init="auto")
     n_features = 0
     diff_col = 0
+    num_processed = 0
 
     for batch in batch_data(jsons, args.batch_size):
         batch_matrix,kmeans_step,n_feature_cols,difficulty_col=_cluster_step(kmeans, batch, args.seed, vocab)
@@ -289,6 +289,9 @@ def cluster_step(args, json_paths) -> list:
             matrix = batch_matrix
         else:
             matrix = np.vstack((matrix, batch_matrix))
+
+        num_processed += len(batch)
+        print(f"{num_processed} documents processed")
 
     data=[]
     # then once we have clusters we need to order
@@ -306,13 +309,13 @@ def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list
         os.remove(outfile)
 
     # there was no clustering & ordering step, just combine json files in json_paths.
-    if not ordered_data:
-        print("Merging shards as is...")
-        with open(outfile, 'wb') as dst:
-            for file in shard_data_paths: # combine shards
-                with open(file, 'rb') as src:
-                    shutil.copyfileobj(src, dst)
-        return
+    # if not ordered_data:
+    #     print("Merging shards as is...")
+    #     with open(outfile, 'wb') as dst:
+    #         for file in shard_data_paths: # combine shards
+    #             with open(file, 'rb') as src:
+    #                 shutil.copyfileobj(src, dst)
+    #     return
 
     jsons_location = str(Path(text_attribute_json_paths[0]).parents[0])
     shards_location = str(Path(shard_data_paths[0]).parents[0])
@@ -321,15 +324,19 @@ def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list
         # if we do have ordered data... pull it from the specified json based on metadata then write to the final output file.
         print(f"Ordered {len(ordered_data)} documents. Merging...")
         for obj in ordered_data:
-            rank = obj["rank"]
-            pid = obj["pid"]
-            idx = obj["row"]
+            rank = int(obj["rank"])
+            pid = int(obj["pid"])
+            idx = int(obj["idx"])
             line = linecache.getline(f"{shards_location}/merged.out_rank{rank}_dump.json_pid{pid}.json", idx)
             out.write(line)
 
 
 if __name__ == "__main__":
     args = parse(ClusterArgs)
+
+    if args.method.endswith("-reverse"):
+        args.reverse = True
+        args.method.replace("-reverse", "")
 
     # gather json paths
     text_attribute_json_paths = glob(args.llm_data_regex)
@@ -338,9 +345,11 @@ if __name__ == "__main__":
         text_attribute_json_paths = sorted(text_attribute_json_paths)
         shard_data_paths = sorted(shard_data_paths)
 
-    if args.weights_json:
+    try:
         with open(args.weights_json, 'r') as weights:
             CLUSTER_WEIGHTS = json.load(weights)
+    except:
+        print(f"Could not locate weights json {args.weights_json}, using default weights.")
 
     # call cluster step
     print(f"Found {len(text_attribute_json_paths)} paths to merge")
