@@ -11,6 +11,7 @@ import inference_auth_token
 import numpy as np
 import asyncio
 import orjson
+import re
 
 from typing import overload
 from simple_parsing import parse
@@ -23,6 +24,7 @@ from glob import glob
 from multiprocessing import Process,Pool,TimeoutError
 from sklearn.cluster import MiniBatchKMeans
 from scipy.cluster.vq import vq
+from load_jsons import load_unindexed_documents, diagnose
 
 
 COMM = MPI.COMM_WORLD
@@ -145,6 +147,7 @@ def process_json_file(arg):
             value["rank"] = RANK
             value["pid"] = pid
             value["row_index"] = index
+            value["collection"] = collection
             jsons.append(value)
             index += 1
 
@@ -173,7 +176,7 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
     
     # give concrete classifications for now
     # todo:: include the subsection of data that the document is from
-    prompt = f"""You are a document classifier. Cluster documents by topic with probabilities. Add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0.001 and 1, 0 is little domain knowledge and 1 is high domain knowledge. vocab_complexity is from 0.001 to 1, 0.001 is simple words and 1 is high amounts of technical jargon or rare words. sentence_quality is a number from 0.001 to 1, indicating how well formed the average sentence is in each document. Include the number of white space separated tokens in the document. Do not use any previous JSON formats. Respond ONLY with a JSON array: [{{"title": "<title>", {category_string}"difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "vocab_complexity": "<vocab_complexity>", "language": "<language>": "tokens": "<number_of_tokens>", "location": "<collection>", "sentence_quality": "<quality>", "idx": "<row_index>", "rank": "<rank>", "pid": "<pid>"}}]"""
+    prompt = f"""You are a document classifier. Cluster documents by topic with probabilities. Add a content difficulty classification for each document into one of: {categories}. Give a prior knowledge rating for each document between 0.001 and 1, 0 is little domain knowledge and 1 is high domain knowledge. vocab_complexity is from 0.001 to 1, 0.001 is simple words and 1 is high amounts of technical jargon or rare words. sentence_quality is a number from 0.001 to 1, indicating how well formed the average sentence is in each document. stem_like is how close the document is to a STEM subject, between 0.00 and 1. Include the number of tokens in the document. Do not use any previous JSON formats. The items in the result should be in the same order that they were sent in. Respond ONLY with a JSON array: [{{"title": "<title>", {category_string}"difficulty": "<content_difficulty>", "prior_knowledge": "<prior_knowledge_value>", "vocab_complexity": "<vocab_complexity>", "language": "<language>": "tokens": "<number_of_tokens>", "location": "<collection>", "sentence_quality": "<quality>", "stem_like": "<stem_like>", "code_percentage": "<code_percentage>"}}]"""
 
     total=0
     # random.shuffle(jsons) # shuffle jsons to ensure we're not processing 1 subset at a time
@@ -182,9 +185,11 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
         
         # Build a multi-document prompt
         doc_texts = []
-        for idx,doc in enumerate(batch):
+        doc_metadata = [] # order is preserved for dictionaries in python 3.7+ so this should work fine. 
+        for idx,doc in enumerate(batch, start=1):
             # documents don't have titles, though all the jsons have a Text attribute
             doc_texts.append(f"collection: {doc.get('collection', 'None')}, idx: {doc.get('row_index', '')}, rank: {doc.get('rank', '')}, pid: {doc.get('pid', '')}, Content: {doc.get('text', '')[:MAX_DOCUMENT_LENGTH]}")
+            doc_metadata.append({"row_index": doc.get('row_index', -1), 'rank': doc.get('rank', -1), 'pid': doc.get('pid', -1), 'collection': doc.get('collection', 'none')})
 
         retries=0
         mult=backoff_mult
@@ -204,6 +209,11 @@ async def process_with_llm(jsons: list, model: str, categories: list[str], batch
                     batch_content = response.choices[0].message.content
                     batch_content = batch_content.replace("```json", "").replace("```", "")
                     batch_results = json.loads(batch_content)
+                    for doc,mdata in zip(batch_results, doc_metadata):
+                        doc["row_index"] = mdata['row_index']
+                        doc['rank'] = mdata['rank']
+                        doc['pid'] = mdata['pid']
+                        doc['collection'] = mdata['collection']
                     # for doc,result in zip(batch, batch_results):
                     #     result["text"] = doc["text"] # I have not noticed that the results are out of order in any capacity.
 
@@ -286,10 +296,7 @@ async def run_corpus_clustering_with_paths(paths: list, nprocs: int, inference_m
     Path is the root directory of the training data
     """
     all_jsons = []
-    # if not tokenized_input:
     all_jsons = do_preprocessing(paths, nprocs, maximum_json_amt)
-    # else:
-        # ... # do we need to do something with jsons here
     
     results=None
     # now that we have a small subset of jsons we do the analysis with an LLM to start
@@ -299,47 +306,16 @@ async def run_corpus_clustering_with_paths(paths: list, nprocs: int, inference_m
     else:
         raise NotImplementedError("Non-llm analysis methods not implemented.")
     
-    # One process should send seed documents to all other processes
-    
-    # overall container
-
-    # some options that may turn into cli args
-    docs_for_clustering = CLUSTER_SIZE
-    idx = 0
-    N_CLUSTERS = 4 # do difficulty clustering for now
-    SEED = 42
-    # kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=SEED, batch_size=BATCH_SIZE, n_init="auto")
     # use generator to build clusters for each rank
     async for batch in results:
         # save batches to a file and do clustering in the separate merge step.
-        if WRITE_BATCHES_TO_FILE:
-            for result in batch:
-                out = open(f'{OUTFILE_NAME}', 'a')
-                try:
-                    out.write(json.dumps(result) + "\n")
-                except Exception as exc:
-                    print_rank_log(f"{exc}")
-                out.close()
-        
-        ...
-
-        # update the clusters with the next batch of data
-        # points,kmeans = cluster_step(kmeans, batch, 42)
-
-        # # print centroids
-        # print_rank_log("New cluster centers:")
-        # print_rank_log(f"{kmeans.cluster_centers_}")
-
-        # # check centroid labels
-        # centroids = kmeans.cluster_centers_[:, -3:] # hardcode difficulty columns (for now)
-        # feature_sums = np.sum(centroids, axis=1) # sum the features of each column to determine an outer label
-        # sorted_centroids = sorted(zip(kmeans.labels_, centroids)) # centroids should converge on average difficulty levels if we have a large enough sample size
-        # CENTROID_LABELS=["easy", "intermediate", "hard", "expert"]
-        # doc_dict = {label: pts for idx,label in enumerate(CENTROID_LABELS, sorted_centroids)}
-
-
-# def run_corpus_clustering_with_strings():
-#     ...
+        for result in batch:
+            out = open(f'{OUTFILE_NAME}', 'a')
+            try:
+                out.write(json.dumps(result) + "\n")
+            except Exception as exc:
+                print_rank_log(f"{exc}")
+            out.close()
 
 
 def get_json_paths(root: Path, subsets: list, max_json_amount):
@@ -376,9 +352,86 @@ def get_json_paths(root: Path, subsets: list, max_json_amount):
 
         paths = maximum_paths
 
-
     print_rank_log(f"Total files after filtering: {len(paths)}")
     return paths
+
+
+async def resume_llm_processing(data_location: str, inference_method: str, model: str, reprocess_all: bool=False):
+    all_text_data = Path(data_location).glob(f"merged.out_rank{RANK}_dump.json_pid*.json")
+    processed_data = Path(data_location).glob(f"merged.out_rank{RANK}.json")
+    
+    documents = {}
+    for dump in all_text_data:
+        pid=int(re.findall(r'pid\d+', str(dump))[0].replace("pid", ''))
+        documents[pid] = []
+        with open(dump, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f, start=1):
+                # if i in already_indexed:
+                #     continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                text = obj.get("text")
+                if text:
+                    documents[pid].append({"text": text[:MAX_DOCUMENT_LENGTH], "pid": int(pid), "row_index": int(i), "rank": int(RANK)})
+                    # yield {"text": text[:MAX_DOCUMENT_LENGTH], "pid": pid, "row_index": i, "rank": RANK}
+    
+    # for key,value in sorted(documents.items()):
+    #     print(f"pid: {key} | {len(value)} docs")
+
+    # processed_documents = {}
+    # for merged in processed_data:
+    #     with open(merged, "r", encoding="utf-8", errors="ignore") as f:
+    #         for i, line in enumerate(f):
+    #             line = line.strip()
+    #             if not line:
+    #                 continue
+    #             try:
+    #                 obj = json.loads(line)
+    #             except json.JSONDecodeError:
+    #                 continue
+    #             if not isinstance(obj, dict):
+    #                 continue
+    #             data_instance = {"row_index": int(obj.get("idx")), "rank": int(obj.get("rank")), "pid": int(obj.get("pid"))}
+    #             if data_instance["pid"] not in processed_documents:
+    #                 processed_documents[data_instance["pid"]] = []
+    #             processed_documents[data_instance["pid"]].append(data_instance)
+
+    all_jsons = []
+    if reprocess_all:
+        print_rank_log("Reprocessing ALL jsons...")
+        for pid,docs in documents.items():
+            all_jsons.extend(docs)
+
+    results=None
+    # now that we have a small subset of jsons we do the analysis with an LLM to start
+    if inference_method == "llm":
+        # get generator
+        results = process_with_llm(all_jsons, model, ["Beginner", "Intermediate", "Advanced", "Expert"])
+    else:
+        raise NotImplementedError("Non-llm analysis methods not implemented.")
+    
+    # kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=SEED, batch_size=BATCH_SIZE, n_init="auto")
+    # use generator to build clusters for each rank
+    if reprocess_all:
+        os.remove(OUTFILE_NAME)
+
+    async for batch in results:
+        # save batches to a file and do clustering in the separate merge step.
+        for result in batch:
+            out = open(f'{OUTFILE_NAME}', 'a')
+            try:
+                out.write(json.dumps(result) + "\n")
+            except Exception as exc:
+                print_rank_log(f"{exc}")
+            out.close()
+
 
 
 if __name__ == "__main__":
@@ -406,14 +459,15 @@ if __name__ == "__main__":
         raise NotImplementedError(f"Available models on {cluster}: {args.MODELS[cluster]}")
 
     # clear any existing json data before the job starts
-    if os.path.exists(OUTFILE_NAME):
-        os.remove(OUTFILE_NAME)
+    if not args.resume_from_checkpoint:
+        if os.path.exists(OUTFILE_NAME):
+            os.remove(OUTFILE_NAME)
 
-    if os.path.exists(OUTFILE_LOG):
-        os.remove(OUTFILE_LOG)
+        if os.path.exists(OUTFILE_LOG):
+            os.remove(OUTFILE_LOG)
 
-    if os.path.exists(OUTFILE_DUMP):
-        os.remove(OUTFILE_DUMP)
+        if os.path.exists(OUTFILE_DUMP):
+            os.remove(OUTFILE_DUMP)
 
     if args.subset_sample_prob_file:
         try:
@@ -446,26 +500,35 @@ if __name__ == "__main__":
         print_rank_log(f"\tNumber of clusters -> {args.n_clusters}")
         print_rank_log(f"\tCategory weights for clustering -> {args.weights_json}")
         print_rank_log(f"\tMaximum cluster points -> {args.max_kmeans_points}")
+        print_rank_log(f"\tSkip clustering? -> {args.resume_from_checkpoint}")
     
     DEFAULT_SAMPLE_PROBABILITY = args.sample_prob
     MAX_DOCUMENT_LENGTH = args.max_doc_length
     WRITE_BATCHES_TO_FILE = args.write_batches_to_file
 
-    paths = []
-    # if not using_preprocessed_input: # if we're not using an existing pre-processed input then we need to load json paths
-    if RANK == 0:
-        paths = get_json_paths(Path(args.data), subsets, args.max_json_amt)
-        random.shuffle(paths) # shuffle the array to attempt to get an even distribution of data for processes
-        chunked_paths = np.array_split(paths, COMM.Get_size())
-        paths = []
-        for chunk in chunked_paths:
-            paths.append(chunk)
-        
-    else: # other processes wait for jsons to process
-        paths = []
+    if args.resume_from_checkpoint:
+        OUTFILE_NAME=str(Path(args.checkpoint_dir).joinpath(Path(OUTFILE_NAME).name))
+        OUTFILE_LOG=f"{args.checkpoint_dir}/rank{RANK}.log"
+        print_rank_log(f"Resuming from checkpoint in {args.checkpoint_dir}")
+        # do a completely different set of instructions for passing things to LLMs here.
+        asyncio.run(resume_llm_processing(args.checkpoint_dir, args.inference_method, args.model, reprocess_all=True))
 
-    paths = COMM.scatter(paths, root=0)
+    else:
+        paths = []
+        # if not using_preprocessed_input: # if we're not using an existing pre-processed input then we need to load json paths
+        if RANK == 0:
+            paths = get_json_paths(Path(args.data), subsets, args.max_json_amt)
+            random.shuffle(paths) # shuffle the array to attempt to get an even distribution of data for processes
+            chunked_paths = np.array_split(paths, COMM.Get_size())
+            paths = []
+            for chunk in chunked_paths:
+                paths.append(chunk)
+            
+        else: # other processes wait for jsons to process
+            paths = []
 
-    # get the corpus metadata
-    asyncio.run(run_corpus_clustering_with_paths(paths, int(args.threads), args.inference_method, args.model, args.categories, args.temperature, args.max_json_amt, args.tokenized_input))
+        paths = COMM.scatter(paths, root=0)
+
+        # get the corpus metadata
+        asyncio.run(run_corpus_clustering_with_paths(paths, int(args.threads), args.inference_method, args.model, args.categories, args.temperature, args.max_json_amt, args.tokenized_input))
 

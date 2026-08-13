@@ -16,12 +16,23 @@ from sklearn.cluster import MiniBatchKMeans
 
 
 # Every other key on a record is treated as "<category_name>": "<probability>"
-RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens", "vocab_complexity", "sentence_quality", "batch_id", "row_index", "pid", "rank"}
+RESERVED_KEYS = {"title", "confidence", "difficulty", "prior_knowledge", "tokens", "vocab_complexity", "sentence_quality", "code_percentage", "stem_like", "batch_id", "row_index", "pid", "rank"}
 _RESERVED_KEYS_NORM = {k.lower().replace(" ", "_").replace("-", "_")
                        for k in RESERVED_KEYS}
 CONFIDENCE_ORDER = ["low", "medium", "high"]
 DIFFICULTY_ORDER = ["beginner", "intermediate", "advanced", "expert"]
 CLUSTERING_WEIGHTS = {}
+
+
+ANCHOR_SUBJECTS = {
+    "Physics": 1.0, "Mathematics": 1.0, "Computer Science": 1.0,
+    "Biology": 1.0, "Chemistry": 1.0, "Engineering": 1.0,
+    "Statistics": 1.0, "Astronomy": 1.0, "Medicine": 0.8,
+    "Economics": 0.4, "Psychology": 0.5, "Linguistics": 0.3,
+    "History": 0.0, "Literature": 0.0, "Philosophy": 0.1,
+    "Art": 0.0, "Music": 0.0, "Law": 0.1, "Sociology": 0.2,
+    "Sports": 0.1, "Business": 0.2, "Politics": 0.1, "Religion": 0.0
+}
 
 
 def build_vocab(parsed):
@@ -88,6 +99,41 @@ def vocab_complexity_to_signed(vocab_complexity):
     return (value - 0.5) * 2
 
 
+def build_stem_weights(vocab, embed_fn, anchor_subjects=ANCHOR_SUBJECTS, sim_floor=0.3):
+    """One-time vocab-term -> fractional STEM score mapping.
+
+    vocab is fixed for the batch (built by build_vocab), so this only needs
+    to run once per batch, not once per document.
+    """
+    anchor_names = list(anchor_subjects.keys())
+    anchor_embs = np.array([embed_fn(name) for name in anchor_names])
+    anchor_norms = np.linalg.norm(anchor_embs, axis=1)
+    anchor_scores = np.array([anchor_subjects[name] for name in anchor_names])
+
+    weights = np.zeros(len(vocab))
+    for i, term in enumerate(vocab):
+        emb = embed_fn(term)
+        sims = anchor_embs @ emb / (anchor_norms * np.linalg.norm(emb))
+        mask = sims > sim_floor
+        if mask.any():
+            w = sims[mask]
+            w = w / w.sum()
+            weights[i] = float((w * anchor_scores[mask]).sum())
+    return weights
+
+
+def document_stemminess(categories: dict, vocab_index: dict, stem_weights: np.ndarray) -> float:
+    total = sum(categories.values())
+    if total == 0:
+        return 0.0
+    score = sum(
+        prob * stem_weights[col]
+        for name, prob in categories.items()
+        if (col := vocab_index.get(name)) is not None
+    )
+    return score / total
+
+
 def parse_records(records, print_num_docs:bool=False):
     """Turn raw JSON records into a flat list of dicts ready for plotting.
 
@@ -107,7 +153,9 @@ def parse_records(records, print_num_docs:bool=False):
             "vocab_complexity": r.get("vocab_complexity", "None"),
             "rank": r.get("rank"),
             "pid": r.get("pid"),
-            "idx": r.get("idx"),
+            "row_index": r.get("row_index"),
+            "stem_like": r.get("stem_like"),
+            "code_percentage": r.get("code_percentage")
         }
 
         categories = {}
@@ -165,7 +213,7 @@ def _cluster_step(kmeans, batch: list, random_seed: int, vocab):
         rank_col = n_feature_cols + 1
         pid_col = n_feature_cols + 2
         n_cols = n_feature_cols + 3
-
+ 
         matrix = np.zeros((len(parsed), n_cols))
         for row, p in enumerate(parsed):
             for name, prob in p["categories"].items():
@@ -177,7 +225,7 @@ def _cluster_step(kmeans, batch: list, random_seed: int, vocab):
             matrix[row, prior_knowledge_col] = prior_knowledge_to_signed(p.get("prior_knowledge")) * CLUSTERING_WEIGHTS.get("prior_knowledge", 0.5)
             matrix[row, vocab_complexity_col] = vocab_complexity_to_signed(p.get("vocab_complexity")) * CLUSTERING_WEIGHTS.get("vocab_complexity", 0.5)
 
-            matrix[row, row_index_col] = p["idx"] if p["idx"] is not None else np.nan
+            matrix[row, row_index_col] = p["row_index"] if p["row_index"] is not None else np.nan
             matrix[row, rank_col] = p["rank"] if p["rank"] is not None else np.nan
             matrix[row, pid_col] = p["pid"] if p["pid"] is not None else np.nan
 
@@ -241,13 +289,35 @@ def cluster_step(args, json_paths) -> list:
             for row, dist in zip(ordered_rows, ordered_distances):
                 records.append({
                     "distance": float(dist),
-                    "idx": None if np.isnan(matrix[row, row_index_col]) else int(matrix[row, row_index_col]),
+                    "row_index": None if np.isnan(matrix[row, row_index_col]) else int(matrix[row, row_index_col]),
                     "rank": None if np.isnan(matrix[row, rank_col]) else int(matrix[row, rank_col]),
                     "pid": None if np.isnan(matrix[row, pid_col]) else int(matrix[row, pid_col]),
                 })
             result.extend(records)
             # result[cluster_id] = records
         return result
+
+    def _order_by_stemminess(data, vocab, reverse=False):
+        """Use cosine similarity to orders documents by how close it is to a 'STEM' topic."""
+        # parsed_batch = parse_records(batch)
+        # matrix, n_feature_cols, difficulty_col = build_matrix(parsed_batch, vocab)
+
+        stem_weights = build_stem_weights(vocab, embed_fn)  # cache this if vocab is stable across batches
+        stem_scores = np.array([
+            document_stemminess(p["categories"], index, stem_weights)
+            for p in parsed_batch
+        ])
+
+        # Order documents by STEMminess, independent of clustering
+        stem_scores = -stem_scores if reverse else stem_scores
+        order = np.argsort(stem_scores)
+        ranked_docs = [parsed_batch[i] for i in order]
+
+        return data
+
+    def _order_by_code_percentage(data, vocab, reverse=False):
+        records = sorted(data, lambda x: (x["code_percentage"], x["title"]))
+        return records
 
     def _none():
         return
@@ -271,39 +341,46 @@ def cluster_step(args, json_paths) -> list:
     if args.method == "none" or args.method == "shuffled":
         return jsons
 
-    matrix = np.array([])
-
-    # here, we do the actual clustering step
-    kmeans = MiniBatchKMeans(n_clusters=args.n_clusters, random_state=args.seed, batch_size=args.batch_size, n_init="auto")
-    n_features = 0
-    diff_col = 0
-    num_processed = 0
-
-    for batch in batch_data(jsons, args.batch_size):
-        batch_matrix,kmeans_step,n_feature_cols,difficulty_col=_cluster_step(kmeans, batch, args.seed, vocab)
-        kmeans = kmeans_step
-        diff_col = difficulty_col
-        n_features = n_feature_cols
-
-        if not matrix.any():
-            matrix = batch_matrix
-        else:
-            matrix = np.vstack((matrix, batch_matrix))
-
-        num_processed += len(batch)
-        print(f"{num_processed} documents processed")
-
     data=[]
+    method = args.method.replace("-reverse", "")
     # then once we have clusters we need to order
-    if args.method == "difficulty":
+    if method == "difficulty":
+        matrix = np.array([])
+        # here, we do the actual clustering step
+        kmeans = MiniBatchKMeans(n_clusters=args.n_clusters, random_state=args.seed, batch_size=args.batch_size, n_init="auto")
+        n_features = 0
+        diff_col = 0
+        num_processed = 0
+
+        for batch in batch_data(jsons, args.batch_size):
+            batch_matrix,kmeans_step,n_feature_cols,difficulty_col=_cluster_step(kmeans, batch, args.seed, vocab)
+            kmeans = kmeans_step
+            diff_col = difficulty_col
+            n_features = n_feature_cols
+
+            if not matrix.any():
+                matrix = batch_matrix
+            else:
+                matrix = np.vstack((matrix, batch_matrix))
+
+            num_processed += len(batch)
+            print(f"{num_processed} documents processed")
+
         data = _order_by_difficulty(matrix, n_features, kmeans, difficulty_col, args.reverse)
+
+    elif method == "stem":
+        data = _order_by_stemminess(parsed, vocab, args.reverse)
+
+    elif method == "code": # todo:: order by percentage of code
+        data = _order_by_code_percentage(parsed, vocab, args.reverse)
+
     else:
         raise Exception(f"Unsupported ordering: {args.ordering_method}")
 
     return data # return final ordered data.
 
 
-def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list, shard_data_paths: list):
+def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list, shard_data_paths: list, args):
     """Writes all data to a file given a specific order from the cluster step. Assumes ordered_data is a list of json dicts"""
     if os.path.exists(outfile):
         os.remove(outfile)
@@ -320,15 +397,27 @@ def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list
     jsons_location = str(Path(text_attribute_json_paths[0]).parents[0])
     shards_location = str(Path(shard_data_paths[0]).parents[0])
 
-    with open(outfile, 'w') as out:
+    with open(outfile, 'wb') as out:
         # if we do have ordered data... pull it from the specified json based on metadata then write to the final output file.
         print(f"Ordered {len(ordered_data)} documents. Merging...")
+        processed = 0
+        skipped = 0
         for obj in ordered_data:
-            rank = int(obj["rank"])
-            pid = int(obj["pid"])
-            idx = int(obj["idx"])
-            line = linecache.getline(f"{shards_location}/merged.out_rank{rank}_dump.json_pid{pid}.json", idx)
-            out.write(line)
+            try:
+                rank = int(obj["rank"])
+                pid = int(obj["pid"])
+                idx = int(obj["row_index"])
+                line = json.loads(linecache.getline(f"{shards_location}/merged.out_rank{rank}_dump.json_pid{pid}.json", idx))
+                text_only = {"text": line["text"]}
+                out.write(orjson.dumps(text_only, option=orjson.OPT_APPEND_NEWLINE))
+                processed+=1
+                if processed % args.batch_size == 0:
+                    print(f"Processed {processed} of {len(ordered_data)}")
+            except:
+                print(f"Skipped {obj['title']}")
+                skipped += 1
+
+        print(f"Processed {processed} / {processed+skipped} docs")
 
 
 if __name__ == "__main__":
@@ -347,7 +436,7 @@ if __name__ == "__main__":
 
     try:
         with open(args.weights_json, 'r') as weights:
-            CLUSTER_WEIGHTS = json.load(weights)
+            CLUSTERING_WEIGHTS = json.load(weights)
     except:
         print(f"Could not locate weights json {args.weights_json}, using default weights.")
 
@@ -359,6 +448,6 @@ if __name__ == "__main__":
     # merge results
     outfile = args.outfile
     # merge step (oh god I'm a physicist)
-    merge_step(data, outfile, text_attribute_json_paths, shard_data_paths)
+    merge_step(data, outfile, text_attribute_json_paths, shard_data_paths, args)
 
     print(f"Saved to {outfile}")

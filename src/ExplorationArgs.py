@@ -47,6 +47,11 @@ class ExplorationArgs:
     # misc args
     outfile:str="output.txt"
 
+    # checkpoint args
+    resume_from_checkpoint: bool=False # Skip the unzipping and 
+    checkpoint_dir:str="" # The directory to load the checkpoint from. Fails if the directory does not exist or is empty.
+    reprocess_all:bool=True # reprocess all documents in each json, and wipe the existing documents.
+
 @dataclass
 class ClusterArgs:
     # input args
@@ -55,15 +60,22 @@ class ClusterArgs:
     sort:bool=False # Sort the input files before processing.
 
     # cluster args
-    method: Literal["none", "difficulty"] = "none" # The ordering method to use. None -> merges json files as is | difficulty -> Order by document difficulty. | topic -> Order by topic. If you would like the order reversed, append "-reverse" to the end of the ordering method name. Ex: "difficulty-reverse"
+    """
+    Orderings:
+        none -> Documents are collected into a single json with no specified ordering.
+        difficulty -> Documents are clustered by difficulty metrics with *k* clusters, and sorted from least-difficult to most. Append -reverse to flip.
+        stem -> Documents are ordered by how close they are to being about a STEM topic, least to most. Append -reverse to flip.
+        code -> Documents are ordered by least to most amount of code to standard text. Append -reverse to flip.
+    """
+    method: Literal["none", "difficulty", "difficulty-reverse", "stem", "stem-reverse", "code", "code-reverse"] = "none" # The ordering method to use. None -> merges json files as is | difficulty -> Order by document difficulty. | topic -> Order by topic. If you would like the order reversed, append "-reverse" to the end of the ordering method name. Ex: "difficulty-reverse"
     reverse: bool=False # Reverse the ordering before writing.
     n_clusters: int=4 # number of clusters to create.
     seed:int=42 # The seed for k means.
-    batch_size:int=5000 # batch size for k means.
+    batch_size:int=50000 # batch size for k means.
     weights_json: str="difficulty.json" # the biases for each text attribute in the json. Non-topic weights are 0.5 by default.
     max_kmeans_points: int=-1 # the maximum number of points for updating clusters. Once this limit is reached, centroids become static and new points are fit to the existing centroids. -1 -> all points are used in clustering.
     # cluster_sample_rate_json: str="cluster-sample-rate.json" # sample rate for cluster labels (experimental)
-    write_batches_to_file: bool=True # write the classified data to a file.
+    write_batches_to_file: bool=True # write the data to a file.
 
     # meta args
     outfile:str="output.json" # The final, merged json file name.
