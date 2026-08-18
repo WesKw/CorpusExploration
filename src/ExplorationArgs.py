@@ -85,8 +85,8 @@ class ClusterArgs:
 
 @dataclass
 class DashboardArgs:
-    ezpz_logs_glob: str # glob pattern for the training logs
+    loss_logs_glob: str # glob pattern for the training logs
+    eval_logs_glob: str
     output_dir: str # directory to save the dashboard files
     ezpz_metrics:list=field(default_factory=lambda: ["loss", "grad_norm"])
-    # lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag", "gsm8k", "mathqa", "code_eval"])
-    lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag", "arc_easy", "openbookqa", "lambada_openai", "wikitext"])
+    lm_eval_tasks:list=field(default_factory=lambda: ["arc_easy", "openbookqa", "lambada_openai", "wikitext", "truthfulqa_gen", "truthfulqa_mc1", "truthfulqa_mc2", "gsm8k"])
