@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -l select=1:system=polaris:ncpus=1:ngpus=4
 #PBS -l place=scatter
-#PBS -l walltime=12:00:00
+#PBS -l walltime=04:00:00
 #PBS -l filesystems=home:eagle
 #PBS -q preemptable
 #PBS -A datascience_collab
@@ -92,6 +92,7 @@ for dataset in "${ORDERINGS[@]}"; do
 			--dataloader.no-shuffle-sample-in-corpus \
 			--checkpoint.enable \
 			--checkpoint.interval $checkpoint_interval \
+			--checkpoint.keep_latest_k 20 \
 			--training.local-batch-size=$BATCH_SIZE
 		# echo "skipping training"
 	else # ORDER IS REQUIRED
@@ -115,6 +116,7 @@ for dataset in "${ORDERINGS[@]}"; do
 			--dataloader.no-shuffle-sample-in-corpus \
 			--checkpoint.enable \
 			--checkpoint.interval $checkpoint_interval \
+			--checkpoint.keep_latest_k 20 \
 			--training.local-batch-size=$BATCH_SIZE
 	fi
 
@@ -136,18 +138,18 @@ for dataset in "${ORDERINGS[@]}"; do
 	cp $logdir/$most_recent_log $PLOT_DIR/${checkpoint}.jsonl
 
 	# generate the huggingface model from the final checkpoint
-	python /eagle/datascience_collab/wkwiecinski/torchtitan/torchtitan/experiments/ezpz/eval/convert_to_hf.py /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/step-$last_checkpoint/ /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model --hf_assets_path $HF_MODEL_PATH --model_name experiments.ezpz.agpt --model_flavor $MODEL --export_dtype float32
+	# python /eagle/datascience_collab/wkwiecinski/torchtitan/torchtitan/experiments/ezpz/eval/convert_to_hf.py /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/step-$last_checkpoint/ /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model --hf_assets_path $HF_MODEL_PATH --model_name experiments.ezpz.agpt --model_flavor $MODEL --export_dtype float32
 
 	# copy the tokenizer stuff over to the model
-	cp /eagle/datascience_collab/wkwiecinski/torchtitan/torchtitan/experiments/ezpz/eval/configs/agpt_${MODEL}_config.json /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/config.json
-	cp $HF_MODEL_PATH/*.json /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/
-	cp $HF_MODEL_PATH/tokenizer.model /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/
+	# cp /eagle/datascience_collab/wkwiecinski/torchtitan/torchtitan/experiments/ezpz/eval/configs/agpt_${MODEL}_config.json /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/config.json
+	# cp $HF_MODEL_PATH/*.json /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/
+	# cp $HF_MODEL_PATH/tokenizer.model /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/
 
 	# evaluate with lm_eval
-	echo "Beginning evaluation..."
-	model_location=/eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/
-	lm_eval --model hf --model_args pretrained=$model_location,tokenizer=$model_location,max_length=4096 --tasks hellaswag,arc_easy,openbookqa,lambada_openai,wikitext --device cuda:0 --output_path /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/results --batch_size 4 --log_samples
-	cp /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/results/*/results_*.json $PLOT_DIR/${checkpoint}_lm_eval.json
+	# echo "Beginning evaluation..."
+	# model_location=/eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/model/
+	# lm_eval --model hf --model_args pretrained=$model_location,tokenizer=$model_location,max_length=4096 --tasks hellaswag,arc_easy,openbookqa,lambada_openai,wikitext --device cuda:0 --output_path /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/results --batch_size 4 --log_samples
+	# cp /eagle/datascience_collab/wkwiecinski/torchtitan/outputs/$checkpoint/results/*/results_*.json $PLOT_DIR/${checkpoint}_lm_eval.json
 
 done
 

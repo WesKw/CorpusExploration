@@ -43,6 +43,27 @@ def build_vocab(parsed):
     return sorted(vocab)
 
 
+def convert_percentage_to_float(percentage):
+    value = 0.0
+
+    if type(percentage) == float:
+        if percentage > 1.01:
+            percentage = percentage / 100.0
+        return percentage
+    
+    # sometimes the llm is stupid and gives me a percent
+    if percentage.endswith("%"):
+        value = float(percentage.replace('%', '')) / 100.0
+    
+    else:
+        value = float(percentage)
+        if value > 1.01:
+            value = value / 100.0
+
+    return value
+
+
+
 def parse_probability(value):
     """Coerce a probability field (often a string) into a float, or None."""
     if value is None or value == "":
@@ -154,8 +175,8 @@ def parse_records(records, print_num_docs:bool=False):
             "rank": r.get("rank"),
             "pid": r.get("pid"),
             "row_index": r.get("row_index"),
-            "stem_like": r.get("stem_like"),
-            "code_percentage": r.get("code_percentage")
+            "stem_like": float(r.get("stem_like", -1.0)),
+            "code_percentage": convert_percentage_to_float(r.get("code_percentage", -1.0))
         }
 
         categories = {}
@@ -296,27 +317,32 @@ def cluster_step(args, json_paths) -> list:
             result.extend(records)
             # result[cluster_id] = records
         return result
-
-    def _order_by_stemminess(data, vocab, reverse=False):
+    
+    def _order_by_stemminess(parsed_records, reverse=False):
         """Use cosine similarity to orders documents by how close it is to a 'STEM' topic."""
         # parsed_batch = parse_records(batch)
         # matrix, n_feature_cols, difficulty_col = build_matrix(parsed_batch, vocab)
 
-        stem_weights = build_stem_weights(vocab, embed_fn)  # cache this if vocab is stable across batches
-        stem_scores = np.array([
-            document_stemminess(p["categories"], index, stem_weights)
-            for p in parsed_batch
-        ])
+        # stem_weights = build_stem_weights(vocab, embed_fn)  # cache this if vocab is stable across batches
+        # stem_scores = np.array([
+        #     document_stemminess(p["categories"], index, stem_weights)
+        #     for p in parsed_records
+        # ])
 
         # Order documents by STEMminess, independent of clustering
-        stem_scores = -stem_scores if reverse else stem_scores
-        order = np.argsort(stem_scores)
-        ranked_docs = [parsed_batch[i] for i in order]
+        # stem_scores = -stem_scores if reverse else stem_scores
+        # order = np.argsort(stem_scores)
+        # ranked_docs = [parsed_records[i] for i in order]
+        # LLM includes a "stem_like" field so we probably don't even need to do anything fancy...
+        ranked_docs = sorted(parsed_records, key=lambda x: x["stem_like"])
+        if reverse:
+            ranked_docs = ranked_docs[::-1]
+        return ranked_docs
 
-        return data
-
-    def _order_by_code_percentage(data, vocab, reverse=False):
-        records = sorted(data, lambda x: (x["code_percentage"], x["title"]))
+    def _order_by_code_percentage(data, reverse=False):
+        records = sorted(data, key=lambda x: x["code_percentage"])
+        if reverse:
+            records = records[::-1]
         return records
 
     def _none():
@@ -369,10 +395,10 @@ def cluster_step(args, json_paths) -> list:
         data = _order_by_difficulty(matrix, n_features, kmeans, difficulty_col, args.reverse)
 
     elif method == "stem":
-        data = _order_by_stemminess(parsed, vocab, args.reverse)
+        data = _order_by_stemminess(parsed, args.reverse)
 
     elif method == "code": # todo:: order by percentage of code
-        data = _order_by_code_percentage(parsed, vocab, args.reverse)
+        data = _order_by_code_percentage(parsed, args.reverse)
 
     else:
         raise Exception(f"Unsupported ordering: {args.ordering_method}")
@@ -384,15 +410,6 @@ def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list
     """Writes all data to a file given a specific order from the cluster step. Assumes ordered_data is a list of json dicts"""
     if os.path.exists(outfile):
         os.remove(outfile)
-
-    # there was no clustering & ordering step, just combine json files in json_paths.
-    # if not ordered_data:
-    #     print("Merging shards as is...")
-    #     with open(outfile, 'wb') as dst:
-    #         for file in shard_data_paths: # combine shards
-    #             with open(file, 'rb') as src:
-    #                 shutil.copyfileobj(src, dst)
-    #     return
 
     jsons_location = str(Path(text_attribute_json_paths[0]).parents[0])
     shards_location = str(Path(shard_data_paths[0]).parents[0])
@@ -413,6 +430,7 @@ def merge_step(ordered_data: list, outfile: str, text_attribute_json_paths: list
                 processed+=1
                 if processed % args.batch_size == 0:
                     print(f"Processed {processed} of {len(ordered_data)}")
+                    if "code_percentage" in obj: print(obj["title"], obj["code_percentage"])
             except:
                 print(f"Skipped {obj['title']}")
                 skipped += 1

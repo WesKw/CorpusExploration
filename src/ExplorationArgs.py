@@ -89,4 +89,4 @@ class DashboardArgs:
     output_dir: str # directory to save the dashboard files
     ezpz_metrics:list=field(default_factory=lambda: ["loss", "grad_norm"])
     # lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag", "gsm8k", "mathqa", "code_eval"])
-    lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag"])
+    lm_eval_tasks:list=field(default_factory=lambda: ["hellaswag", "arc_easy", "openbookqa", "lambada_openai", "wikitext"])

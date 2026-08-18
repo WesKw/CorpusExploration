@@ -1,9 +1,9 @@
 #!/bin/bash -l
-#PBS -l select=32:system=crux
+#PBS -l select=10:system=crux
 #PBS -l place=scatter
-#PBS -l walltime=24:00:00
+#PBS -l walltime=20:00:00
 #PBS -l filesystems=home:eagle
-#PBS -q workq-route
+#PBS -q preemptable
 #PBS -A datascience_collab
 
 export OLMIX="/eagle/datascience_collab/venkatv/olmo-mix-1124/data/"
@@ -27,16 +27,19 @@ cd /home/wkwiecinski/CorpusExploration/src
 
 # save_dir="$model-clustering-$sample-$sampleprob-$temp-maxjsons$max_jsons-maxlength$max_doc_length"
 save_dir="/eagle/datascience_collab/wkwiecinski/runs/$model-$PBS_JOBID"
+# save_dir="/eagle/datascience_collab/wkwiecinski/runs/$model-$PBS_JOBID"
 mkdir -p $save_dir
 out="$save_dir/merged.out"
-
 cp $sample_prob_json $save_dir
 
+# resume dir
+resume_dir="/eagle/datascience_collab/wkwiecinski/runs/backup/"
+
 # python exploration.py $OLMIX --threads 4 --subset $subset --sample-prob $sampleprob --model $model
-mpiexec -n 24 python exploration.py \
+mpiexec -n 10 python exploration.py \
     --data $OLMIX --threads $threads --sample_prob $sampleprob --model $model \
     --max_json_amt $max_jsons --max_doc_length $max_doc_length --outfile $out \
-    --subset_sample_prob_file $sample_prob_json --cluster $cluster
+    --subset_sample_prob_file $sample_prob_json --cluster $cluster --resume_from_checkpoint --checkpoint_dir $resume_dir
 
 # python ordering_step.py "$save_dir/*_rank?.txt" --outfile "$out"
 # python visualize_clusters.py "$out" --out "cluster_dashboard_$PBS_JOBID.png"
