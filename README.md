@@ -14,3 +14,10 @@ Goal:
 This repo consists of code for running on ALCF systems for pre-processing corpus data,
 and clustering and ordering the data, and running lm\_eval benchmarkls. A separate torchtitan 
 fork located at https://github.com/saforem2/torchtitan is used to run model pre-training.
+
+
+
+# WARNING
+A lot of the bash scripts in here use absolute paths because I was doing a lot of quick & dirty work
+to get things running. Running this locally will probably need a bit of modification of replacing paths 
+with $HOME and such.
