@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "Citation"
+authors:
+- family-names: "Kwiecinski"
+  given-names: "Wesley"
+  orcid: "https://orcid.org/0009-0004-2273-9102"
+title: "Corpus Exploration"
+version: 0.0.1
+url: "https://github.com/WesKw/CorpusExploration"
